@@ -40,7 +40,10 @@ FEEDS = [
     ("NDTV Profit", "https://feeds.feedburner.com/ndtvprofit-latest"),
 ]
 MAX_AGE_H = 3            # a headline older than this is not news any more
-DAY_CAP = 40             # notifications in 12 hours, at most
+DAY_CAP = 60             # notifications in 12 hours, at most
+PER_RUN = 5              # notifications from one run, at most (20.10: the
+                         # first run sent 36 at once, and the 12-hour cap
+                         # then held back everything else that day)
 MARKET_STYLE = (
     "You pick headlines for an Indian share trader's phone. From the "
     "numbered headlines below, give the numbers of the few (at most 4) that "
@@ -80,9 +83,9 @@ def clean(t):
     return re.sub(r"\s+", " ", t).strip()
 
 
-def key(t):
+def key(t, size=120):
     t = re.sub(r"[^a-z0-9 ]", " ", t.lower())
-    return " ".join(w for w in t.split() if len(w) > 2)[:120]
+    return " ".join(w for w in t.split() if len(w) > 2)[:size]
 
 
 def rss(url, source):
@@ -147,6 +150,19 @@ def which(title, groups):
             out.append(s)
             break
     return out
+
+
+def digest_body(rows):
+    """Headlines in one notification, newest last, kept under ntfy's 4 KB
+    (beyond that it would arrive as a file)."""
+    lines, size = [], 0
+    for it, lab, _p in reversed(rows):
+        ln = "%s: %s (%s)" % (lab, it["title"], it["source"])
+        if size + len(ln.encode("utf-8")) + 2 > 3800:
+            break
+        lines.insert(0, ln)
+        size += len(ln.encode("utf-8")) + 2
+    return "\n\n".join(lines)
 
 
 def ntfy_poll(topic):
@@ -227,6 +243,9 @@ def main():
     max_age = ((24 - quiet[0] + quiet[1]) % 24 + 1) if morning else MAX_AGE_H
     done = set(key(m.get("message", "")) for m in sent)
     done |= set(key(m.get("title", "")) for m in sent)
+    # the headlines inside a digest ("Overnight", "More") count as sent too
+    digests = " ".join(key(m.get("message", ""), 10 ** 6) for m in sent
+                       if re.match(r"(Overnight|More)\b", m.get("title") or ""))
     budget = DAY_CAP - len(sent)
     if budget <= 0:
         log("daily cap reached")
@@ -258,7 +277,10 @@ def main():
     # the held shares by name, a few names to a search
     names = [g for g in (cfg.get("held") or []) if g]
     for i in range(0, len(names), 6):
-        q = " OR ".join('"%s"' % (g[1] if len(g) > 1 else g[0])
+        # the company's full name searches best ("Ashok Leyland", not
+        # ASHOKLEY)
+        q = " OR ".join('"%s"' % next((x for x in g[1:] if " " in str(x)),
+                                      g[1] if len(g) > 1 else g[0])
                         for g in names[i:i + 6])
         try:
             for it in google(q):
@@ -270,7 +292,8 @@ def main():
             pass
         time.sleep(0.5)
     fresh = [it for it in items if it["age"] is not None and
-             0 <= it["age"] <= max_age and key(it["title"]) not in done]
+             0 <= it["age"] <= max_age and key(it["title"]) not in done and
+             not (digests and key(it["title"]) in digests)]
     log("headlines read: %d, fresh: %d" % (len(items), len(fresh)))
 
     mine, others = [], []
@@ -299,18 +322,25 @@ def main():
     out.sort(key=lambda x: x[0]["age"], reverse=True)      # oldest first
     if morning and len(out) > 6:
         # the night's news in one notification, then normal again
-        body = "\n\n".join("%s: %s (%s)" % (lab, it["title"], it["source"])
-                           for it, lab, _p in out[-12:])
-        ntfy_send(topic, "Overnight: %d headlines" % len(out), body)
+        ntfy_send(topic, "Overnight: %d headlines" % len(out), digest_body(out))
         log("overnight digest sent: %d" % len(out))
         return 0
+    room = min(PER_RUN, max(0, budget))
+    rest = []
+    if len(out) > room and room >= 2:
+        # the newest one by one; the others together in one notification
+        rest, out = out[:len(out) - room + 1], out[len(out) - room + 1:]
     n = 0
-    for it, lab, pr in out[:max(0, budget)]:
+    if rest:
+        if ntfy_send(topic, "More: %d headlines" % len(rest), digest_body(rest)):
+            n += 1
+        time.sleep(1.2)
+    for it, lab, pr in out[:room]:
         if ntfy_send(topic, "%s · %s" % (lab, it["source"]), it["title"],
                      click=it["link"], priority=pr):
             n += 1
         time.sleep(1.2)
-    log("sent: %d" % n)
+    log("sent: %d (%d in one 'More')" % (n, len(rest)))
     return 0
 
 
