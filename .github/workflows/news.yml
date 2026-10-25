@@ -1,8 +1,10 @@
 name: CAS news to the phone
 on:
   schedule:
-    # every 10 minutes from 6:30 in the morning to 10:30 at night, India time
-    - cron: "*/10 1-17 * * *"
+    # a new run every 15 minutes from 6:30 in the morning to 11 at night,
+    # India time; each run stays on for 25 minutes and looks for news every
+    # 5, so when GitHub starts a run late the news still comes steadily
+    - cron: "4-59/15 1-17 * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -12,14 +14,21 @@ concurrency:
 jobs:
   news:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+      - name: Remember what was already sent
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: news-${{ github.workflow }}-${{ github.run_id }}
+          restore-keys: news-${{ github.workflow }}-
       - name: Send new headlines
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           WATCH: ${{ secrets.WATCH }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          RUN_MINUTES: "25"
         run: python3 notify.py
       - name: Keep the schedule alive
         # GitHub stops the schedule of a repository untouched for 60 days;
@@ -31,5 +40,5 @@ jobs:
             git config user.email "cas-news@users.noreply.github.com"
             date -u > keepalive.txt
             git add keepalive.txt
-            git commit -m "keep the schedule alive" && git push
+            git commit -m "keep the schedule alive" && git push || true
           fi
