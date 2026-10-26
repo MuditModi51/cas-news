@@ -20,7 +20,8 @@ like any other app's (its own sound, silent switch and Focus settings).
 Settings come from the repository's secrets (set by the dashboard):
   NTFY_TOPIC  the ntfy name the phone is subscribed to
   WATCH       JSON {"held": [[SYMBOL, term, ...], ...], "watch": [...],
-                    "names": {SYMBOL: company name}, "quiet": [22, 7]}
+                    "names": {SYMBOL: company name}, "quiet": [22, 7],
+                    "alerts": [[SYMBOL, price, until, price then, note]]}
   GEMINI_KEY  the Gemini key (relevance checks and translation)
 What was sent and what was already judged is kept between runs in a small
 file (state.json, through GitHub's cache), and what ntfy itself remembers.
@@ -137,18 +138,25 @@ STYLE = (
     "not opinion, not previews or 'trade setup' and support levels, not "
     "'stocks to buy' lists, not weekly market-value round-ups, not routine "
     "market-close reports.\n"
-    "KOLKATA - a real piece of news about Kolkata or West Bengal: government "
-    "decisions, business, jobs, infrastructure, metro and transport, power and "
-    "water, weather warnings, elections and politics, law and order of public "
-    "importance. Not gossip, not film or TV, not small crimes.\n"
-    "SHARE - the headline is mainly about one of the listed companies below "
-    "(results, orders, deals, ratings or targets, management, regulator "
-    "action, a big price move). Not another company or a person with a "
-    "similar name, not a list where it is one of many, not sport.\n"
-    "POLICY - Indian economic or market policy and regulation: RBI, SEBI, "
-    "ministries, tax, GST, budget, trade and industry policy.\n"
-    "GLOBAL - big world market or economy news: the Fed, US or Chinese "
-    "markets, oil, trade wars, major geopolitical events.\n"
+    "KOLKATA - MAJOR news about Kolkata or West Bengal only: big government "
+    "decisions, large investments and jobs, major infrastructure, metro and "
+    "transport disruptions, power or water crises, severe weather warnings, "
+    "elections and important politics, serious law-and-order events. Not "
+    "routine politics or speeches, not gossip, film or TV, not single "
+    "crimes or accidents.\n"
+    "SHARE - MAJOR news mainly about one of the listed companies below: "
+    "quarterly results, large orders or contracts, mergers, acquisitions, "
+    "stake sales, dividends, bonus or split, rating or target changes by "
+    "known brokers, a change of chairman, CEO or MD, regulator or tax "
+    "action, a sharp share-price move. Not routine filings, small "
+    "appointments, AGM notices, generic articles, or lists where it is one "
+    "of many; not another company or a person with a similar name.\n"
+    "POLICY - MAJOR Indian economic or market policy decisions: RBI, SEBI, "
+    "ministries, tax, GST, budget, trade and industry policy actually "
+    "decided or announced - not speeches, opinions or consultations.\n"
+    "GLOBAL - MAJOR world market or economy news only: Fed decisions, big "
+    "moves in US or Chinese markets, oil shocks, trade wars, major "
+    "geopolitical events.\n"
     "NONE - anything else: minor items, routine filings (AGM notices, "
     "postal ballots, board-meeting dates, junior appointments), and anything "
     "OLD - about an earlier quarter, year or month than the latest (results "
@@ -297,11 +305,11 @@ def ntfy_poll(topic):
     return msgs
 
 
-def ntfy_send(topic, title, body, click=None, tags="newspaper"):
+def ntfy_send(topic, title, body, click=None, tags="newspaper", prio="3"):
     # priority 3 = the phone's own settings decide sound and banner, like
     # any other app (silent switch, Focus, Notification settings)
     hdr = {"Title": title.encode("utf-8").decode("latin-1", "ignore")[:250],
-           "Priority": "3", "Tags": tags}
+           "Priority": prio, "Tags": tags}
     if click:
         hdr["Click"] = click
     req = urllib.request.Request("%s/%s" % (NTFY, topic),
@@ -340,6 +348,25 @@ def ask_gemini(key_, prompt):
         except Exception:
             continue
     return None
+
+
+def yahoo_minutes(sym):
+    """Today's one-minute bars of an NSE share: [(time, high, low, close)]."""
+    url = ("https://query2.finance.yahoo.com/v8/finance/chart/%s.NS"
+           "?range=1d&interval=1m" % urllib.parse.quote(sym))
+    r = json.loads(fetch(url, 15))["chart"]["result"][0]
+    q = (r.get("indicators") or {}).get("quote") or [{}]
+    q = q[0]
+    out = []
+    for t, hi, lo, c in zip(r.get("timestamp") or [], q.get("high") or [],
+                            q.get("low") or [], q.get("close") or []):
+        if c is not None and hi is not None and lo is not None:
+            out.append((int(t), float(hi), float(lo), float(c)))
+    return out
+
+
+def money(v):
+    return "{:,.2f}".format(float(v))
 
 
 def load_state():
@@ -386,6 +413,67 @@ class Bot:
         self.state = load_state()
         self.state.setdefault("judged", {})
         self.state.setdefault("sent", [])
+
+    # ---- price alerts (20.12): while the Mac is off, the alerts he set in
+    # the dashboard are checked here, from Yahoo's minute bars (a touch is
+    # any minute whose high and low span the price). The Mac sends the same
+    # alert first when it is on - the title is looked for in what ntfy
+    # already carries, so it never comes twice.
+    def check_alerts(self, msgs):
+        alerts = self.cfg.get("alerts") or []
+        if not alerts:
+            return 0
+        now = datetime.datetime.now(IST)
+        mins = now.hour * 60 + now.minute
+        if now.weekday() >= 5 or not (9 * 60 + 15 <= mins <= 15 * 60 + 35):
+            return 0
+        st = self.state.setdefault("alerts", {})
+        today = now.date().isoformat()
+        sent = 0
+        for a in alerts:
+            try:
+                sym, price, until = str(a[0]), float(a[1]), str(a[2])
+                note = str(a[4]) if len(a) > 4 and a[4] else ""
+            except (IndexError, TypeError, ValueError):
+                continue
+            if until < today:
+                continue
+            k = "%s|%s" % (sym, price)
+            one = st.setdefault(k, {"seen": 0, "hitAt": 0})
+            try:
+                bars = yahoo_minutes(sym)
+            except Exception as e:
+                log("alert price failed:", sym, type(e).__name__)
+                continue
+            since = max(one.get("seen") or 0, time.time() - 900)
+            fresh = [b for b in bars if b[0] > since]
+            if not fresh:
+                continue
+            one["seen"] = fresh[-1][0]
+            hit = [b for b in fresh if b[2] <= price <= b[1]]
+            if not hit or time.time() - (one.get("hitAt") or 0) < 1800:
+                continue
+            one["hitAt"] = time.time()
+            if any("PRICE ALERT" in (m.get("title") or "") and sym in
+                   (m.get("title") or "") and money(price) in
+                   (m.get("title") or "") and
+                   time.time() - (m.get("time") or 0) < 3600
+                   for m in msgs or []):
+                continue                 # the Mac has told him already
+            last = fresh[-1][3]
+            up = last >= price
+            t = datetime.datetime.fromtimestamp(hit[0][0], IST)
+            if ntfy_send(self.topic, "PRICE ALERT - %s Rs %s" % (
+                    sym, money(price)),
+                    "%s %s \u20b9%s at %s - now \u20b9%s.%s\n(checked from "
+                    "GitHub while the Mac is off; until %s)" % (
+                        sym, "rose to" if up else "fell to", money(price),
+                        t.strftime("%H:%M"), money(last),
+                        (" " + note) if note else "", until),
+                    "https://www.nseindia.com/get-quotes/equity?symbol=" +
+                    urllib.parse.quote(sym), tags="bell", prio="4"):
+                sent += 1
+        return sent
 
     # ---- what has gone already
     def remember_ntfy(self, msgs):
@@ -612,15 +700,19 @@ class Bot:
                 log("quiet hours - nothing sent")
                 break
             t0 = time.time()
+            try:
+                total += self.check_alerts(ntfy_poll(self.topic))
+            except Exception as e:
+                log("alerts failed:", type(e).__name__)
             queue = self.check(first) or []
             first = False
             save_state(self.state)
             if queue:
-                # one at a time, spread over the time to the next look -
-                # never a burst (at most one a minute when there are many)
-                room = max(CHECK_EVERY, deadline - time.time()) \
-                    if len(queue) > 5 else CHECK_EVERY
-                gap = max(20.0, min(120.0, room / len(queue)))
+                # 20.11: sent as soon as found - together if several came
+                # together, and the night's news all at once at 7 (each
+                # still its own notification); a short pause only so that
+                # ntfy keeps them in order
+                gap = 2.0
                 for n, (it, kind, sym, en) in enumerate(queue):
                     if time.time() > deadline + 120 or night_now(self.quiet):
                         # the rest wait for the next run
