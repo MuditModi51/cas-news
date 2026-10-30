@@ -98,6 +98,35 @@ LOCAL_FEEDS = [
 ]
 LOCAL_SOURCES = {s for s, _u in LOCAL_FEEDS}
 
+
+def local_setup(city, region):
+    """20.14: the place chosen in the dashboard (Profile -> Local news).
+    Kolkata / West Bengal keeps the papers above; anywhere else uses Google
+    News's local pages for that city and a search for the state, in
+    English. Returns (feeds, words regex, label)."""
+    city = re.sub(r"[^A-Za-z .-]", "", city or "").strip()[:40]
+    region = re.sub(r"[^A-Za-z .&-]", "", region or "").strip()[:40]
+    if (not city and not region) or (
+            city.lower() in ("kolkata", "calcutta", "howrah", "") and
+            (region or "west bengal").lower() in ("west bengal", "bengal")):
+        return (LOCAL_FEEDS, r"kolkata|bengal|howrah|calcutta|mamata|suvendu",
+                "Kolkata", "West Bengal")
+    q = urllib.parse.quote
+    feeds = []
+    if city:
+        feeds.append(("Google News " + city, "https://news.google.com/rss/"
+                      "headlines/section/geo/" + q(city) +
+                      "?hl=en-IN&gl=IN&ceid=IN:en"))
+        feeds.append(("Google News " + city, "https://news.google.com/rss/"
+                      "search?q=" + q('"%s" when:2d' % city) +
+                      "&hl=en-IN&gl=IN&ceid=IN:en"))
+    if region:
+        feeds.append(("Google News " + region, "https://news.google.com/rss/"
+                      "search?q=" + q('"%s" news when:2d' % region) +
+                      "&hl=en-IN&gl=IN&ceid=IN:en"))
+    words = "|".join(re.escape(w) for w in (city, region) if w)
+    return feeds, words, city or region, region or city
+
 # words that make a headline worth a look for the market, policy and global
 # kinds (the Gemini check then decides); used alone when there is no Gemini
 MARKET_WORDS = re.compile(
@@ -228,6 +257,30 @@ def similar(a, b):
     if len(wa) < 4 or len(wb) < 4:
         return False
     return len(wa & wb) / float(min(len(wa), len(wb))) >= 0.7
+
+
+RESULT_WORDS = re.compile(r"(?i)\b(q[1-4]|results?|profit|loss|earnings|"
+                          r"quarter|ebitda|revenue)\b")
+
+
+def same_story(a, b, name=""):
+    """20.14: one share's story told twice in other words ("Vedanta Oil and
+    Gas Q2 profits fall 21% to Rs 746 crore" / "Vedanta Oil and Gas swings
+    to Rs 746 crore profit in Q2") - the same figure, or half the words, or
+    both about the share's results."""
+    # the company's own name is in both and says nothing about the story
+    # ("Ashok Leyland Q2 profit jumps" / "Ashok Leyland bags army order")
+    wn = words(name)
+    wa, wb = words(a) - wn, words(b) - wn
+    if not wa or not wb:
+        return False
+    na = set(re.findall(r"\d[\d,.]{1,}", a or "")) - {"2026", "2027"}
+    nb = set(re.findall(r"\d[\d,.]{1,}", b or "")) - {"2026", "2027"}
+    if na & nb:
+        return True
+    if len(wa & wb) / float(min(len(wa), len(wb))) >= 0.45:
+        return True
+    return bool(RESULT_WORDS.search(a or "") and RESULT_WORDS.search(b or ""))
 
 
 def is_indic(t):
@@ -410,6 +463,8 @@ class Bot:
                 self.names[g[0]] = next((x for x in g[1:] if " " in str(x)),
                                         g[1] if len(g) > 1 else g[0])
         self.quiet = cfg.get("quiet") or [22, 7]
+        self.local_feeds, self.local_rx, self.city, self.region = \
+            local_setup(cfg.get("city"), cfg.get("region"))
         self.state = load_state()
         self.state.setdefault("judged", {})
         self.state.setdefault("sent", [])
@@ -482,14 +537,29 @@ class Bot:
             link = m.get("click") or ""
             if link and link not in have:
                 self.state["sent"].append({"link": link, "title": m.get(
-                    "message", ""), "at": m.get("time") or time.time()})
+                    "message", ""), "at": m.get("time") or time.time(),
+                    "sym": (m.get("title") or "").split(" · ")[0].strip()})
 
     def already(self, it):
         if it["link"] in {x.get("link") for x in self.state["sent"]}:
             return True
-        return any(similar(it["title"], x.get("title", "")) or (
-            it.get("en") and similar(it["en"], x.get("title", "")))
-            for x in self.state["sent"])
+        if any(similar(it["title"], x.get("title", "")) or (
+                it.get("en") and similar(it["en"], x.get("title", "")))
+                for x in self.state["sent"]):
+            return True
+        # 20.14: a share's news once per story - the same share within
+        # eight hours and the same story in other words
+        sym = it.get("sym") or ""
+        if sym and sym not in ("MARKET", "KOLKATA", "POLICY", "GLOBAL",
+                               "SHARE"):
+            recent = time.time() - 8 * 3600
+            for x in self.state["sent"]:
+                if x.get("sym") == sym and (x.get("at") or 0) >= recent and \
+                        same_story(it.get("en") or it["title"],
+                                   x.get("title", ""),
+                                   self.names.get(sym, "")):
+                    return True
+        return False
 
     # ---- reading
     def gather(self):
@@ -504,7 +574,7 @@ class Bot:
                 it["kind_hint"] = kind
                 items.append(it)
         for kind, feeds in (("in", INDIAN_FEEDS), ("wo", GLOBAL_FEEDS),
-                            ("local", LOCAL_FEEDS)):
+                            ("local", self.local_feeds)):
             for src, url in feeds:
                 try:
                     add(rss(url, src), kind)
@@ -571,7 +641,10 @@ class Bot:
         for i in range(0, len(cands), 60):
             part = cands[i:i + 60]
             today = datetime.datetime.now(IST).strftime("%A %d %B %Y")
-            ans = ask_gemini(self.gemini, (STYLE % today) + listing +
+            style = STYLE.replace("Kolkata or West Bengal", "%s or %s" % (
+                self.city, self.region)).replace(
+                "trader in Kolkata", "trader in " + self.city)
+            ans = ask_gemini(self.gemini, (style % today) + listing +
                              "\n\nHeadlines:\n" +
                              "\n".join("%d. %s" % (n + 1, it["title"])
                                        for n, it in enumerate(part)))
@@ -603,7 +676,7 @@ class Bot:
                 if kind == "SHARE" and sym not in self.names:
                     continue
                 if kind == "KOLKATA" and it["kind_hint"] != "local" and \
-                        not re.search(r"kolkata|bengal|howrah|calcutta",
+                        not re.search(self.local_rx,
                                       it["title"] + " " + en, re.I):
                     continue
                 self.state["judged"][it["link"]] = {"at": now, "kind": kind}
@@ -622,11 +695,11 @@ class Bot:
                 kind = None
             elif it["kind_hint"] == "in" and BIG_WORDS.search(t):
                 kind = "MARKET"
-            elif it["kind_hint"] == "local" and it["from"] in (
+            elif it["kind_hint"] == "local" and (it["from"] in (
                     "TOI Kolkata", "HT Kolkata", "Indian Express Kolkata",
-                    "Millennium Post") and re.search(
-                        r"kolkata|bengal|howrah|calcutta|mamata|suvendu", t,
-                        re.I):
+                    "Millennium Post") or it["from"].startswith(
+                        "Google News ")) and re.search(self.local_rx, t,
+                                                       re.I):
                 kind = "KOLKATA"
             elif which(t, self.held) or which(t, self.watch):
                 kind, sym = "SHARE", (which(t, self.held) or
@@ -643,7 +716,8 @@ class Bot:
 
     # ---- sending
     def send(self, it, kind, sym, en):
-        label = {"MARKET": "MARKET", "KOLKATA": "KOLKATA", "POLICY": "POLICY",
+        label = {"MARKET": "MARKET", "KOLKATA": self.city.upper(),
+                 "POLICY": "POLICY",
                  "GLOBAL": "GLOBAL"}.get(kind, sym or "SHARE")
         tags = {"MARKET": "chart_with_upwards_trend", "KOLKATA": "round_pushpin",
                 "POLICY": "classical_building", "GLOBAL": "globe_with_meridians"
@@ -651,7 +725,7 @@ class Bot:
         if ntfy_send(self.topic, "%s · %s" % (label, it["source"]), en,
                      click=it["link"], tags=tags):
             self.state["sent"].append({"link": it["link"], "title": en,
-                                       "at": time.time()})
+                                       "at": time.time(), "sym": label})
             return True
         return False
 
@@ -685,8 +759,11 @@ class Bot:
         # one story once, even when three papers carry it
         out = []
         for p in sorted(picked, key=lambda x: (ORDER[x[1]], -(x[0]["age"] or 0))):
-            if not any(similar(p[3], q[3]) for q in out) and \
-                    not self.already(dict(p[0], en=p[3])):
+            if not any(similar(p[3], q[3]) or (
+                    p[2] and p[2] == q[2] and same_story(
+                        p[3], q[3], self.names.get(p[2], "")))
+                    for q in out) and \
+                    not self.already(dict(p[0], en=p[3], sym=p[2] or "")):
                 out.append(p)
         log("read %d, new %d, chosen %d" % (len(items), len(cands), len(out)))
         return out
