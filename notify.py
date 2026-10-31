@@ -191,6 +191,12 @@ STYLE = (
     "OLD - about an earlier quarter, year or month than the latest (results "
     "for a year or quarter already reported long ago, a meeting date that has "
     "passed).\n"
+    "URGENT - add |URGENT at the very end of a line ONLY for news so big it "
+    "must reach him even at night: a war or military operation involving "
+    "India, an attack on or the death of a national leader or of a giant of "
+    "Indian business, a disaster with very many dead, a market crash or a "
+    "trading halt, an emergency RBI or government decision. Almost nothing "
+    "is URGENT.\n"
     "When several headlines tell the same story, mark only the best one and "
     "the rest NONE. Be strict: when in doubt, NONE. Answer one line per headline that is "
     "not NONE, exactly: number|KIND|SYMBOL|headline in English. SYMBOL only "
@@ -261,6 +267,27 @@ def similar(a, b):
 
 RESULT_WORDS = re.compile(r"(?i)\b(q[1-4]|results?|profit|loss|earnings|"
                           r"quarter|ebitda|revenue)\b")
+# 20.15: the kinds of company event - two headlines about the same company
+# and the same kind of event within a day are one story, whoever printed it
+EVENTS = [
+    ("results", r"q[1-4]|results?|profit|loss|earnings|quarter|ebitda|revenue|margin"),
+    ("dividend", r"dividend|payout|record date"),
+    ("bonus/split", r"bonus|split|sub-?division"),
+    ("buyback", r"buy-?back"),
+    ("top job", r"\bceo\b|\bmd\b|chairman|managing director|resign|steps? down|appoint|names? .* as|successor|quits"),
+    ("order", r"orders?|contract|bags|wins|secures|l1 bidder|tender"),
+    ("stake", r"stake|block deal|bulk deal|promoter|pledge|offer for sale|\bofs\b"),
+    ("rating", r"target|upgrade|downgrade|rating|buy call|sell call|overweight|underweight|initiates?"),
+    ("deal", r"merger|acquir|acquisition|takeover|demerger|amalgamat|joint venture"),
+    ("funds", r"\bqip\b|fund-?rais|rights issue|preferential|ncd|bonds?"),
+    ("listing", r"\bipo\b|listing|lists? at|debut"),
+    ("trouble", r"\braid|probe|penalty|fine[ds]?\b|sebi order|fraud|fire|accident|strike|shutdown|recall"),
+]
+EVENT_RX = [(k, re.compile(r"(?i)\b(?:" + v + ")")) for k, v in EVENTS]
+
+
+def event_of(t):
+    return {k for k, rx in EVENT_RX if rx.search(t or "")}
 
 
 def same_story(a, b, name=""):
@@ -280,7 +307,13 @@ def same_story(a, b, name=""):
         return True
     if len(wa & wb) / float(min(len(wa), len(wb))) >= 0.45:
         return True
-    return bool(RESULT_WORDS.search(a or "") and RESULT_WORDS.search(b or ""))
+    if RESULT_WORDS.search(a or "") and RESULT_WORDS.search(b or ""):
+        return True
+    # 20.15: the same kind of event for the same company (results, dividend,
+    # a CEO change, an order win...) - only when each has one clear kind,
+    # so "profit jumps; bags order" is not taken for a plain results story
+    ea, eb = event_of(a), event_of(b)
+    return len(ea) == 1 and ea == eb
 
 
 def is_indic(t):
@@ -380,6 +413,22 @@ def ntfy_send(topic, title, body, click=None, tags="newspaper", prio="3"):
             log("send failed:", type(e).__name__)
             time.sleep(3)
     return False
+
+
+def to_english(t):
+    """20.15: a Bengali (or Hindi) headline Gemini left untranslated is put
+    into English by Google's free translator; None if that fails too - an
+    untranslated headline is never sent."""
+    if not is_indic(t):
+        return t
+    try:
+        url = ("https://translate.googleapis.com/translate_a/single?client=gtx"
+               "&sl=auto&tl=en&dt=t&q=" + urllib.parse.quote(t[:500]))
+        d = json.loads(fetch(url, 12).decode("utf-8"))
+        en = "".join(x[0] for x in d[0] if x and x[0]).strip()
+        return en if en and not is_indic(en) else None
+    except Exception:
+        return None
 
 
 def ask_gemini(key_, prompt):
@@ -552,7 +601,7 @@ class Bot:
         sym = it.get("sym") or ""
         if sym and sym not in ("MARKET", "KOLKATA", "POLICY", "GLOBAL",
                                "SHARE"):
-            recent = time.time() - 8 * 3600
+            recent = time.time() - 24 * 3600
             for x in self.state["sent"]:
                 if x.get("sym") == sym and (x.get("at") or 0) >= recent and \
                         same_story(it.get("en") or it["title"],
@@ -644,7 +693,13 @@ class Bot:
             style = STYLE.replace("Kolkata or West Bengal", "%s or %s" % (
                 self.city, self.region)).replace(
                 "trader in Kolkata", "trader in " + self.city)
-            ans = ask_gemini(self.gemini, (style % today) + listing +
+            recent = [x.get("title", "") for x in self.state["sent"][-40:]
+                      if (x.get("at") or 0) >= time.time() - 18 * 3600]
+            seen = ("\n\nALREADY SENT TODAY - a headline telling any of these "
+                    "stories again, in other words or from another paper, is "
+                    "NONE:\n" + "\n".join("- " + t for t in recent[-30:])
+                    if recent else "")
+            ans = ask_gemini(self.gemini, (style % today) + listing + seen +
                              "\n\nHeadlines:\n" +
                              "\n".join("%d. %s" % (n + 1, it["title"])
                                        for n, it in enumerate(part)))
@@ -669,10 +724,17 @@ class Bot:
                     tok = rest.pop(0).strip()
                     if tok not in ("", "-"):
                         sym = tok
+                urgent = False
+                if len(rest) > 1 and rest[-1].strip().upper() == "URGENT":
+                    rest = rest[:-1]
+                    urgent = True
                 en = clean("|".join(rest)).strip(" -")
                 if not 1 <= n <= len(part) or kind not in ORDER:
                     continue
                 it = part[n - 1]
+                en = to_english(en or it["title"])
+                if not en:
+                    continue
                 if kind == "SHARE" and sym not in self.names:
                     continue
                 if kind == "KOLKATA" and it["kind_hint"] != "local" and \
@@ -680,6 +742,8 @@ class Bot:
                                       it["title"] + " " + en, re.I):
                     continue
                 self.state["judged"][it["link"]] = {"at": now, "kind": kind}
+                if urgent:
+                    it["urgent"] = True
                 out.append((it, kind, sym if kind == "SHARE" else "",
                             en or it["title"]))
         return out
@@ -739,7 +803,7 @@ class Bot:
         # still one notification of its own, spaced out)
         wake = now.replace(hour=self.quiet[1], minute=0, second=0,
                            microsecond=0)
-        morning = first and not any(
+        morning = first and not night_now(self.quiet) and not any(
             x.get("at", 0) >= wake.timestamp() for x in self.state["sent"])
         max_age = ((24 - self.quiet[0] + self.quiet[1]) % 24 + 1) \
             if morning else MAX_AGE_H
@@ -766,6 +830,29 @@ class Bot:
                     not self.already(dict(p[0], en=p[3], sym=p[2] or "")):
                 out.append(p)
         log("read %d, new %d, chosen %d" % (len(items), len(cands), len(out)))
+        if night_now(self.quiet):
+            # 20.15: at night only world news (at most eight a night) and the
+            # rare URGENT Indian story go now; the rest wait for 7 o'clock
+            day = now.strftime("%Y-%m-%d") if now.hour >= 12 else \
+                (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+            nc = self.state.setdefault("night", {})
+            if nc.get("day") != day:
+                nc.clear()
+                nc.update(day=day, n=0)
+            go, hold = [], []
+            for p in out:
+                if p[0].get("urgent") or (p[1] == "GLOBAL" and nc["n"] < 8):
+                    go.append(p)
+                    if not p[0].get("urgent"):
+                        nc["n"] += 1
+                else:
+                    hold.append(p)
+            self.state["pending"] = (self.state.get("pending") or []) + [
+                {"item": x[0], "kind": x[1], "sym": x[2], "en": x[3],
+                 "at": time.time(), "age0": x[0].get("age") or 0}
+                for x in hold]
+            log("night: %d now, %d for the morning" % (len(go), len(hold)))
+            return go
         return out
 
     def run(self):
@@ -773,9 +860,7 @@ class Bot:
         deadline = start + RUN_MINUTES * 60
         first, total = True, 0
         while True:
-            if night_now(self.quiet):
-                log("quiet hours - nothing sent")
-                break
+            night = night_now(self.quiet)
             t0 = time.time()
             try:
                 total += self.check_alerts(ntfy_poll(self.topic))
@@ -791,7 +876,7 @@ class Bot:
                 # ntfy keeps them in order
                 gap = 2.0
                 for n, (it, kind, sym, en) in enumerate(queue):
-                    if time.time() > deadline + 120 or night_now(self.quiet):
+                    if time.time() > deadline + 120:
                         # the rest wait for the next run
                         self.state["pending"] = [
                             {"item": x[0], "kind": x[1], "sym": x[2],
@@ -805,8 +890,8 @@ class Bot:
                     if n < len(queue) - 1:
                         time.sleep(gap)
             left = deadline - time.time()
-            if left < 60:
-                break
+            if left < 60 or night:
+                break                     # at night one look a run is enough
             time.sleep(max(5.0, min(left, CHECK_EVERY - (time.time() - t0))))
         save_state(self.state)
         log("sent: %d" % total)
