@@ -5,6 +5,9 @@ on:
     # India time; each run stays on for 25 minutes and looks for news every
     # 5, so when GitHub starts a run late the news still comes steadily
     - cron: "4-59/15 1-17 * * *"
+    # 20.15: at night one short look every half hour - world news and the
+    # rare urgent Indian story only (the rest waits for the morning)
+    - cron: "19,49 18-23,0 * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -30,6 +33,18 @@ jobs:
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           RUN_MINUTES: "25"
         run: python3 notify.py
+      - name: What the phone reads while the laptop is off
+        # 20.15: IPOs, corporate actions, the F&O ban list and F&O figures
+        # (public market figures only) into snapshot.json in this repository
+        if: ${{ hashFiles('snapshot.py') != '' && hashFiles('cas_server.py') != '' }}
+        env:
+          WATCH: ${{ secrets.WATCH }}
+        run: |
+          python3 snapshot.py || exit 0
+          git config user.name "cas-news"
+          git config user.email "cas-news@users.noreply.github.com"
+          git add snapshot.json
+          git commit -m "snapshot" -q && (git push -q || (git pull --rebase -q && git push -q)) || true
       - name: Keep the schedule alive
         # GitHub stops the schedule of a repository untouched for 60 days;
         # a tiny note is written once a month so that never happens
