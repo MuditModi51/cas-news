@@ -1,4 +1,4 @@
-"""SMART - what the phone reads while the laptop is off (20.15).
+"""Capital Compass - what the phone reads while the laptop is off (20.15).
 
 Runs on GitHub's free computers after each look for news (every 15 minutes
 in the day, every half hour at night). It uses the dashboard's own program
