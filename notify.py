@@ -159,14 +159,16 @@ STYLE = (
     "You choose news notifications for an Indian share trader in Kolkata. "
     "Today is %s. For each numbered headline below decide its kind, using "
     "only these:\n"
-    "MARKET - only the few stories (four or five a day) that move the WHOLE "
-    "Indian stock market or a whole sector today: RBI or US Fed decisions, "
-    "a sharp move in crude, the rupee or global markets, heavy FII selling "
-    "or buying, war or a crisis, a big government decision, a sharp Sensex/"
-    "Nifty move with its cause. Not single companies, not regional unrest, "
-    "not opinion, not previews or 'trade setup' and support levels, not "
-    "'stocks to buy' lists, not weekly market-value round-ups, not routine "
-    "market-close reports.\n"
+    "MARKET - only the stories that move the WHOLE Indian stock market or a "
+    "whole sector today (usually four or five a day; more on a day of a "
+    "very big move): RBI or US Fed decisions, a sharp move in crude, the "
+    "rupee or global markets, heavy FII selling or buying, war or a crisis, "
+    "a big government decision, a sharp Sensex/Nifty move with its cause. "
+    "On a day when the Sensex or Nifty moves more than 1%%, the closing "
+    "report with its reasons IS MARKET. Not single companies, not regional "
+    "unrest, not opinion, not previews or 'trade setup' and support levels, "
+    "not 'stocks to buy' lists, not weekly market-value round-ups, not "
+    "routine market-close reports on a quiet day.\n"
     "KOLKATA - MAJOR news about Kolkata or West Bengal only: big government "
     "decisions, large investments and jobs, major infrastructure, metro and "
     "transport disruptions, power or water crises, severe weather warnings, "
@@ -201,7 +203,10 @@ STYLE = (
     "the rest NONE. Be strict: when in doubt, NONE. Answer one line per headline that is "
     "not NONE, exactly: number|KIND|SYMBOL|headline in English. SYMBOL only "
     "for SHARE, else -. Translate a Bengali or Hindi headline into plain "
-    "English; keep an English one as it is. No other text. If all are NONE "
+    "English WORD FOR WORD - never add a name, title, post, party or any "
+    "fact that is not in the headline itself (people's posts change; yours "
+    "may be out of date); keep an English one exactly as it is. No other "
+    "text. If all are NONE "
     "answer NONE.\n\nListed companies (SYMBOL = name):\n")
 
 
@@ -435,8 +440,10 @@ def ask_gemini(key_, prompt):
     # the lighter models first: they have the larger free daily allowance
     models = [m for m in (os.environ.get("GEMINI_MODELS") or "").split(",")
               if m.strip()] or ["gemini-flash-lite-latest",
-                                "gemini-2.5-flash-lite", "gemini-flash-latest",
-                                "gemini-2.5-flash"]
+                                "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+                                "gemini-3.5-flash", "gemini-flash-latest"]
+    # 20.17: the 2.5 models answer 404 now ("no longer available") - with
+    # them as the only fallbacks, one busy model meant no news at all
     for model in models:
         url = ("https://generativelanguage.googleapis.com/v1beta/models/%s:"
                "generateContent?key=%s" % (model, urllib.parse.quote(key_)))
@@ -445,7 +452,7 @@ def ask_gemini(key_, prompt):
         req = urllib.request.Request(url, data=body.encode(), headers={
             "Content-Type": "application/json"})
         try:
-            d = json.loads(urllib.request.urlopen(req, timeout=60).read())
+            d = json.loads(urllib.request.urlopen(req, timeout=30).read())
             return d["candidates"][0]["content"]["parts"][0]["text"]
         except Exception:
             continue
@@ -678,8 +685,10 @@ class Bot:
             # Gemini busy for a moment: wait for it (the headlines are
             # looked at again in five minutes) rather than send what the
             # word rules let through; only after 45 minutes the rules step in
+            # 20.17: 10 minutes, not 45 - a headline is dropped once it is
+            # three hours old, so a long wait lost news
             since = self.state.setdefault("gemFailSince", time.time())
-            if time.time() - since < 45 * 60:
+            if time.time() - since < 10 * 60:
                 return []
         return self.judge_rules(cands)
 
@@ -732,7 +741,16 @@ class Bot:
                 if not 1 <= n <= len(part) or kind not in ORDER:
                     continue
                 it = part[n - 1]
-                en = to_english(en or it["title"])
+                # 20.17: the paper's OWN words are sent, never Gemini's
+                # rewrite - Gemini called the Chief Minister "opposition
+                # leader" (from its old knowledge) and could shorten a
+                # headline. A Bengali/Hindi one goes through Google's
+                # translator, which translates and adds nothing
+                if not is_indic(it["title"]):
+                    en = clean(it["title"])
+                else:
+                    en = to_english(it["title"]) or (
+                        en if en and not is_indic(en) else None)
                 if not en:
                     continue
                 if kind == "SHARE" and sym not in self.names:
