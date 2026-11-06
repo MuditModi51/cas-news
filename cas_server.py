@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CAS Dashboard - local server  (version 6)
+Capital Compass - local server
 
 PRICE SOURCES, in order:
   1. BULK - one request returns a whole index of stocks. The server TRIES a
@@ -169,7 +169,7 @@ MACRO_WORDS = [
     "bond yield", "interest rate", "stimulus", "policy", "sector", "circuit",
 ]
 
-VERSION = "20.16"
+VERSION = "20.19"
 
 # Always shown
 INDICES = [
@@ -1089,6 +1089,24 @@ def make_backup(tag=""):
         for f in rolling:
             daily[f[10:20]] = f            # the last copy of each day
         keep = set(rolling[-BACKUP_KEEP:]) | set(sorted(daily.values())[-30:])
+        # 20.18: and each day's FULLEST copy (most rows with something
+        # typed), so a wipe late in a day can never push out that day's
+        # good copy - 1 Nov's survived only because the dashboard was shut
+        best = {}
+        for f in files:
+            if f[10:20] < (datetime.date.today() - datetime.timedelta(
+                    days=30)).isoformat():
+                continue
+            try:
+                with open(os.path.join(bdir, f)) as fh:
+                    nn = json.load(fh).get("notes") or {}
+                typed = sum(1 for v in nn.values() if isinstance(v, dict) and
+                            any(str(x or "").strip() for x in v.values()))
+            except Exception:
+                continue
+            if typed > best.get(f[10:20], (-1, ""))[0]:
+                best[f[10:20]] = (typed, f)
+        keep |= {f for _t, f in best.values()}
         special = [f for f in files if f not in rolling]
         keep |= set(special[-10:])
         for old in files:
@@ -1121,6 +1139,40 @@ def list_backups():
     except Exception:
         pass
     return out
+
+
+def backup_preview(name):
+    """20.18: exactly what putting a backup back would change - every box of
+    the table that differs (share, column, now -> in the backup), shares
+    added or gone, and which settings differ - before anything is done."""
+    if not re.fullmatch(r"cas_state_[0-9_\-]+(_\w+)?\.json", name or ""):
+        return {"ok": False, "note": "not a backup file name"}
+    try:
+        b = json.load(open(os.path.join(PATHS["backups"], name)))
+    except Exception as e:
+        return {"ok": False, "note": "could not read it (%s)" % str(e)[:60]}
+    cur = load_state()
+    labels = dict({"buy": "QTY", "purchase": "PRICE", "target": "TARGET",
+                   "old": "OLD", "yesterday": "YESTERDAY", "missed": "MISSED"},
+                  **{k: v for k, v in (cur.get("headings") or {}).items() if v})
+    cn, bn = cur.get("notes") or {}, b.get("notes") or {}
+    cells = []
+    for sym in sorted(set(cn) | set(bn)):
+        a, z = cn.get(sym) or {}, bn.get(sym) or {}
+        for f in sorted(set(a) | set(z)):
+            va, vz = str(a.get(f) or "").strip(), str(z.get(f) or "").strip()
+            if va != vz:
+                cells.append({"sym": sym, "col": labels.get(f, f.upper()),
+                              "now": va, "backup": vz})
+    cw, bw = cur.get("watchlist") or [], b.get("watchlist") or []
+    skip = {"notes", "watchlist", "_phoneRev", "_chgRates"}
+    settings = sorted(k for k in set(cur) | set(b) if k not in skip and
+                      json.dumps(cur.get(k), sort_keys=True) !=
+                      json.dumps(b.get(k), sort_keys=True))
+    return {"ok": True, "cells": cells[:400], "cellCount": len(cells),
+            "added": [s for s in bw if s not in cw],
+            "gone": [s for s in cw if s not in bw],
+            "settings": settings}
 
 
 def restore_backup(name):
@@ -3124,7 +3176,7 @@ def load_progress():
 
 
 GEMINI_FILE = os.path.join(DATA_DIR, "gemini.json")
-GEMINI = {"key": "", "model": "gemini-flash-latest"}
+GEMINI = {"key": "", "model": "gemini-flash-lite-latest"}
 GEMINI_SHIPPED = ""
 
 
@@ -3134,7 +3186,7 @@ def gemini_load():
         with open(GEMINI_FILE) as f:
             d = json.load(f)
         GEMINI["key"] = (d.get("key") or GEMINI_SHIPPED).strip()
-        GEMINI["model"] = d.get("model") or "gemini-flash-latest"
+        GEMINI["model"] = d.get("model") or "gemini-flash-lite-latest"
     except Exception:
         pass
 
@@ -3163,8 +3215,8 @@ def gemini_save(key=None, model=None):
 # THE GEMINI LOG (20.14): everything a person asks Gemini for - the
 # assistant, Ask, the AI view and its replies - one line each in
 # Data/gemini_log.csv (that profile's own). On the administrator's computer
-# it is also written to "Gemini log.csv" in the folder above Backend (his
-# files 2 folder), and a copy that uses his key (the one shipped) sends its
+# it is also written to "Gemini log.csv" in the folder above Backend (the
+# Capital Compass Backend folder), and a copy that uses his key (the one shipped) sends its
 # lines to him there through a quiet ntfy channel - each user was told so
 # when the profile was made (and can use a key of his own instead).
 # ---------------------------------------------------------------------------
@@ -3279,9 +3331,143 @@ ASK_STYLE = ("You are helping someone read Indian financial news quickly. "
              "so in one line.\n\nQuestion: ")
 
 
-GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash",
-                 "gemini-2.0-flash", "gemini-flash-lite-latest",
-                 "gemini-2.5-flash-lite"]
+# 20.17: tested on his key on 6 Nov 2026 - the 2.5 models answer 404 ("no
+# longer available"), which is the "Gemini error 404" he saw on every
+# fallback. Lite models first: they answer fastest and have the most free
+# use. Models Google adds later are found by themselves (gem_discover), and
+# a model that answers 404 is set aside for a day (GEM_DEAD).
+GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite",
+                 "gemini-3.1-flash-lite", "gemini-3.5-flash",
+                 "gemini-flash-latest"]
+GEM_DEAD = {}       # model -> until when it is not tried (404: gone)
+GEM_BUSY = {}       # model -> until when it is tried last (503, too slow)
+GEM_FOUND = {"at": 0, "models": []}
+GEM_LAST = {"src": "gemini"}
+
+
+def gem_discover():
+    """Once a day: the text models Google offers now (flash and flash-lite,
+    no voice/image/preview ones), so a renamed model never stops it."""
+    if time.time() - GEM_FOUND["at"] < 86400 or not GEMINI["key"]:
+        return
+    GEM_FOUND["at"] = time.time()
+    try:
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models"
+            "?pageSize=200", headers={"X-goog-api-key": GEMINI["key"]})
+        d = json.loads(urllib.request.urlopen(req, timeout=8).read()
+                       .decode("utf-8", "replace"))
+    except Exception:
+        return
+    names = []
+    for m in d.get("models") or []:
+        n = str(m.get("name") or "").replace("models/", "")
+        if "generateContent" not in (m.get("supportedGenerationMethods")
+                                     or []):
+            continue
+        if re.fullmatch(r"gemini-\d+(\.\d+)?-flash(-lite)?", n):
+            names.append(n)
+
+    def rank(n):
+        v = re.match(r"gemini-(\d+(?:\.\d+)?)", n)
+        return (0 if n.endswith("-lite") else 1, -float(v.group(1)))
+    GEM_FOUND["models"] = sorted(names, key=rank)[:6]
+
+
+def gem_order():
+    """The models to try, in order: his saved one, the tested list, then
+    the ones found today. Busy ones go last, gone ones not at all."""
+    gem_discover()
+    now, seen = time.time(), []
+    for m in [GEMINI["model"]] + GEMINI_MODELS + GEM_FOUND["models"]:
+        if m and m not in seen and GEM_DEAD.get(m, 0) < now:
+            seen.append(m)
+    ok = [m for m in seen if GEM_BUSY.get(m, 0) < now]
+    return ok + [m for m in seen if m not in ok]
+
+
+def gem_mark(model, why):
+    why = str(why or "")
+    if "404" in why:
+        GEM_DEAD[model] = time.time() + 86400
+    elif "503" in why or "overloaded" in why or "timed out" in why:
+        GEM_BUSY[model] = time.time() + 120
+
+
+# ---------------------------------------------------------------------------
+# THE BACKUP AI (20.17) - Ollama, free, running on this Mac. Used only when
+# every Gemini model has failed. Nothing goes to the internet. Once he has
+# installed the Ollama app, the dashboard fetches a small model by itself.
+# ---------------------------------------------------------------------------
+OLLAMA = {"url": "http://127.0.0.1:11434", "model": "", "at": 0, "up": False,
+          "pulling": False, "error": ""}
+OLLAMA_DEFAULT = "gemma3:4b"
+OLLAMA_LIKE = ("gemma", "qwen", "llama", "mistral", "phi")
+
+
+def _ollama_pull():
+    OLLAMA["pulling"] = True
+    try:
+        req = urllib.request.Request(
+            OLLAMA["url"] + "/api/pull", method="POST",
+            data=json.dumps({"model": OLLAMA_DEFAULT,
+                             "stream": False}).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=3600).read()
+        OLLAMA["error"] = ""
+    except Exception as e:
+        OLLAMA["error"] = "fetching %s: %s" % (OLLAMA_DEFAULT, str(e)[:80])
+    finally:
+        OLLAMA["pulling"] = False
+        OLLAMA["at"] = 0
+
+
+def ollama_model():
+    """The backup model ready on this Mac, or "" (checked once a minute)."""
+    if time.time() - OLLAMA["at"] < 60:
+        return OLLAMA["model"] if OLLAMA["up"] else ""
+    OLLAMA["at"] = time.time()
+    try:
+        d = json.loads(urllib.request.urlopen(
+            OLLAMA["url"] + "/api/tags", timeout=2).read().decode())
+        OLLAMA["up"] = True
+    except Exception:
+        OLLAMA["up"], OLLAMA["model"] = False, ""
+        return ""
+    names = [str(m.get("name") or "") for m in d.get("models") or []]
+    pick = next((n for k in OLLAMA_LIKE for n in names
+                 if n.lower().startswith(k)), names[0] if names else "")
+    OLLAMA["model"] = pick
+    if not pick and not OLLAMA["pulling"]:
+        threading.Thread(target=_ollama_pull, daemon=True).start()
+    return pick
+
+
+def ask_ollama(prompt, timeout=120):
+    m = ollama_model()
+    if not m:
+        return None, ("backup AI: fetching its model" if OLLAMA["pulling"]
+                      else "backup AI not installed")
+    try:
+        req = urllib.request.Request(
+            OLLAMA["url"] + "/api/generate", method="POST",
+            data=json.dumps({"model": m, "prompt": prompt, "stream": False,
+                             "options": {"temperature": 0.2}}).encode(),
+            headers={"Content-Type": "application/json"})
+        d = json.loads(urllib.request.urlopen(req, timeout=timeout).read()
+                       .decode("utf-8", "replace"))
+        text = re.sub(r"(?s)<think>.*?</think>", "",
+                      str(d.get("response") or "")).strip()
+        return (text or None), ("" if text else "backup AI: empty answer")
+    except Exception as e:
+        return None, "backup AI: %s" % str(e)[:60]
+
+
+def ollama_status():
+    m = ollama_model()
+    return {"installed": OLLAMA["up"], "model": m,
+            "pulling": OLLAMA["pulling"], "error": OLLAMA["error"],
+            "want": OLLAMA_DEFAULT}
 
 
 # 20.15: every question to Gemini goes into the Gemini log - including
@@ -3333,22 +3519,31 @@ def ask_gemini(q, style=None, timeout=12):
     """A 503 from Google means that model is overloaded, NOT that the key is
     bad - his key authenticated fine. So work down the list of models and
     give each one a second try before moving on."""
-    if not GEMINI["key"]:
-        return None, "no key"
     tried = []
-    order = [GEMINI["model"]] + [m for m in GEMINI_MODELS
-                                 if m != GEMINI["model"]]
-    for model in order:
-        text, why = _gemini_once(q, model, style, timeout)
-        if text:
-            if model != GEMINI["model"]:
-                GEMINI["model"] = model          # remember what worked
-                gemini_save()
-            return text, ""
-        tried.append("%s: %s" % (model, why))
-        if "key refused" in why or "no key" in why:
-            break
-    return None, " | ".join(tried[:3])
+    if GEMINI["key"]:
+        for n, model in enumerate(gem_order()[:5]):
+            # 20.17: a slow model costs at most 15 s after the first
+            text, why = _gemini_once(q, model, style,
+                                     timeout if n == 0 else min(timeout, 15))
+            if text:
+                GEM_LAST["src"] = "gemini"
+                if model != GEMINI["model"]:
+                    GEMINI["model"] = model          # remember what worked
+                    gemini_save()
+                return text, ""
+            gem_mark(model, why)
+            tried.append("%s: %s" % (model, why))
+            if "key refused" in why or "no key" in why:
+                break
+    else:
+        tried.append("no Gemini key")
+    # 20.17: every Gemini model failed - the backup AI on this Mac
+    text, why = ask_ollama((style or ASK_STYLE) + q)
+    if text:
+        GEM_LAST["src"] = "ollama"
+        return text, ""
+    tried.append(why)
+    return None, " | ".join(tried)
 
 
 ask_gemini = _gem_logged(ask_gemini)
@@ -4175,8 +4370,7 @@ def voice_command(data):
 def gemini_parts(parts, timeout=25, contents=None, system=None):
     """Like ask_gemini, for a request made of several parts (a recording),
     or a whole conversation (contents) with standing instructions."""
-    order = [GEMINI["model"]] + [m for m in GEMINI_MODELS
-                                 if m != GEMINI["model"]]
+    order = gem_order()
     why = ""
     for model in order[:4]:
         url = ("https://generativelanguage.googleapis.com/v1beta/models/%s"
@@ -4201,10 +4395,27 @@ def gemini_parts(parts, timeout=25, contents=None, system=None):
             why = "empty answer"
         except urllib.error.HTTPError as e:
             why = "Gemini error %s" % e.code
+            gem_mark(model, why)
             if e.code in (400, 401, 403):
                 break
         except Exception as e:
             why = str(e)[:60]
+            gem_mark(model, why)
+    # 20.17: a request of plain text only can go to the backup AI as well
+    try:
+        texts = [str(p.get("text") or "") for c in (contents or [{"parts": parts}])
+                 for p in (c.get("parts") or [])]
+        plain = all("inline_data" not in p for c in (contents or [{"parts": parts}])
+                    for p in (c.get("parts") or []))
+    except Exception:
+        texts, plain = [], False
+    if plain and any(texts):
+        t2, w2 = ask_ollama(((system or "") + "\n\n" if system else "")
+                            + "\n\n".join(texts))
+        if t2:
+            GEM_LAST["src"] = "ollama"
+            return t2, ""
+        why = why + " | " + w2
     return None, why
 
 
@@ -4249,8 +4460,9 @@ def ask(q):
     gsec = round(time.time() - t0, 1)
     gemini_log("Ask", q, text or ("failed: %s" % why))
     if text:
-        return {"ok": True, "answer": text, "source": "Gemini",
-                "gemini": "ok in %ss" % gsec}
+        return {"ok": True, "answer": text,
+                "source": "Backup AI on this Mac" if GEM_LAST["src"] ==
+                "ollama" else "Gemini", "gemini": "ok in %ss" % gsec}
     t1 = time.time()
     text, title = ask_wikipedia(q)
     wsec = round(time.time() - t1, 1)
@@ -4691,12 +4903,14 @@ BG_RUN = {}
 BG_LOCK = threading.Lock()
 
 
-def stale_ok(name, has, fresh, refresh):
-    """Return True when the caller may answer with what it has now."""
+def stale_ok(name, has, fresh, refresh, too_old=False):
+    """Return True when the caller may answer with what it has now.
+    20.19: never once it is too old - then it is read again now, and what
+    that reading gives (or its failure) is what is shown."""
     if fresh:
         return True
-    if not has:
-        return False                     # nothing yet: read it now
+    if not has or too_old:
+        return False                     # nothing usable: read it now
     with BG_LOCK:
         if BG_RUN.get(name):
             return True
@@ -4721,7 +4935,8 @@ def fetch_ipos(force=False):
     # GMP and subscription move through the day - five minutes at most
     if not force and stale_ok("ipo", bool(IPO_CACHE["rows"]),
                               time.time() - IPO_CACHE["at"] < 300,
-                              lambda: fetch_ipos(True)):
+                              lambda: fetch_ipos(True),
+                              time.time() - IPO_CACHE["at"] > 900):
         return IPO_CACHE
     with IPO_READ_LOCK:                  # one reading at a time
         if not force and IPO_CACHE["rows"] and \
@@ -5358,7 +5573,8 @@ def fetch_corp_actions(force=False):
     """
     if not force and stale_ok("corp", bool(CORP_CACHE["rows"]),
                               time.time() - CORP_CACHE["at"] < 1800,
-                              lambda: fetch_corp_actions(True)):
+                              lambda: fetch_corp_actions(True),
+                              time.time() - CORP_CACHE["at"] > 5400):
         return CORP_CACHE["rows"]
     with CORP_READ_LOCK:                 # one reading at a time
         if not force and CORP_CACHE["rows"] and \
@@ -9810,6 +10026,66 @@ def xround(x, n=0):
     return float(d)
 
 
+# 20.19: the rates of the charges, by name, so a contract note can correct
+# one (with his yes) from the note's date onward - trades before that date
+# keep the rate they were made at. Defaults are the rates in force when
+# 20.19 was made (Zerodha's charges page and NSE/BSE circulars).
+CHG_RATES = {
+    "stt_del": (0.001, "STT on delivery buys and sales", "% of the value"),
+    "stt_intra": (0.00025, "STT on intraday sales", "% of the value"),
+    "exch_nse": (0.0000307, "NSE transaction charge (with the IPF "
+                 "contribution)", "% of the value"),
+    "exch_bse": (0.0000375, "BSE transaction charge", "% of the value"),
+    "sebi": (0.000001, "SEBI turnover fee (Rs 10 a crore)",
+             "% of the value"),
+    "gst": (0.18, "GST on brokerage, exchange and SEBI charges",
+            "% of those charges"),
+    "stamp_del": (0.00015, "Stamp duty on delivery buys", "% of the value"),
+    "stamp_intra": (0.00003, "Stamp duty on intraday buys",
+                    "% of the value"),
+}
+_RATE_CACHE = {"at": None, "hist": []}
+_RATE_TL = threading.local()   # 20.19: a rate tried on a contract note,
+                               # in this thread only, never saved
+
+
+def _rate_try():
+    if not hasattr(_RATE_TL, "d"):
+        _RATE_TL.d = {}
+    return _RATE_TL.d
+
+
+def chg_rate_hist():
+    """[{key, v, from, note, at}] - the rates changed from contract notes,
+    oldest first. Kept in the Accounts settings file (accounts_ui.json)."""
+    try:
+        mt = os.path.getmtime(acc_ui_path())
+    except OSError:
+        mt = 0
+    if _RATE_CACHE["at"] != mt:
+        h = [x for x in (acc_ui().get("rates") or [])
+             if isinstance(x, dict) and x.get("key") in CHG_RATES]
+        h.sort(key=lambda x: str(x.get("from") or ""))
+        _RATE_CACHE.update(at=mt, hist=h)
+    return _RATE_CACHE["hist"]
+
+
+def chg_rate(key, d=""):
+    """The rate in force on day d (iso): the newest change made from a
+    date on or before d, else the default."""
+    tr = _rate_try()
+    if key in tr:
+        return tr[key]
+    v = CHG_RATES[key][0]
+    for x in chg_rate_hist():
+        if x["key"] == key and str(x.get("from") or "") <= str(d or "9"):
+            try:
+                v = float(x["v"])
+            except (TypeError, ValueError):
+                pass
+    return v
+
+
 def acc_broker():
     st = load_state()
     p = st.get("prefs") or {}
@@ -9931,25 +10207,27 @@ def acc_compute(acc, broker=None, today=None, upto=None):
         # H: STT, for the whole day, rounded to the rupee
         stt = None
         if not (c["yes"] and c["type"] == "BUY"):
-            rate = (0.00025 if c["type"] == "SELL" else 0) if c["yes"] \
-                else 0.001
-            row = e * (0.00025 if c["yes"] else 0.001)
+            r_in = chg_rate("stt_intra", d)
+            r_del = chg_rate("stt_del", d)
+            rate = (r_in if c["type"] == "SELL" else 0) if c["yes"] \
+                else r_del
+            row = e * (r_in if c["yes"] else r_del)
             cum = cum_stt.get(d, 0.0) + e * rate
             cum_stt[d] = cum
             stt = xround(cum, 0) - xround(cum - row, 0)
         else:
             cum_stt[d] = cum_stt.get(d, 0.0)
         # I: exchange
-        exch = xround(e * (0.0000375 if c["exch"] == "BSE" else 0.0000307),
-                      6)
+        exch = xround(e * chg_rate("exch_bse" if c["exch"] == "BSE"
+                                   else "exch_nse", d), 6)
         # L: SEBI
-        sebi = xround(e * 0.000001, 6)
+        sebi = xround(e * chg_rate("sebi", d), 6)
         # J: GST
-        gst = xround(0.18 * ((brk or 0) + exch + sebi), 4)
+        gst = xround(chg_rate("gst", d) * ((brk or 0) + exch + sebi), 4)
         # K: stamp, for the whole day, rounded to the rupee
         stamp = None
         if c["type"] != "SELL":
-            rate = 0.00003 if c["yes"] else 0.00015
+            rate = chg_rate("stamp_intra" if c["yes"] else "stamp_del", d)
             cum = cum_stamp.get(d, 0.0) + e * rate
             cum_stamp[d] = cum
             stamp = xround(cum, 0) - xround(cum - e * rate, 0)
@@ -9969,8 +10247,9 @@ def acc_compute(acc, broker=None, today=None, upto=None):
                 c["fixed"] = True
         if "brk" in fix or "exchg" in fix or "sebi" in fix:
             if "gst" not in fix:
-                c["gst"] = xround(0.18 * ((c["brk"] or 0) + (c["exchg"] or 0)
-                                          + (c["sebi"] or 0)), 4)
+                c["gst"] = xround(chg_rate("gst", d) * (
+                    (c["brk"] or 0) + (c["exchg"] or 0)
+                    + (c["sebi"] or 0)), 4)
         c["total"] = xround(sum(c[k2] or 0 for k2 in (
             "dp", "brk", "stt", "exchg", "gst", "stamp", "sebi")), 4)
     by_key = {}
@@ -10508,6 +10787,7 @@ def acc_ui():
 
 def acc_ui_save(d):
     _write_json(acc_ui_path(), d)
+    _RATE_CACHE["at"] = None      # 20.19: a rate may have changed
 
 
 def acc_view(fy=None):
@@ -10521,7 +10801,8 @@ def acc_view(fy=None):
         mt = 0
     br = acc_broker()
     key = (acc_path(fy), mt, json.dumps(br, sort_keys=True),
-           datetime.date.today().isoformat())
+           datetime.date.today().isoformat(),
+           json.dumps(chg_rate_hist(), sort_keys=True))
     with ACC_LOCK:
         if fy:
             hit = ACC_PAST.get(key)
@@ -11686,6 +11967,752 @@ def acc_have(acc, o):
     return False
 
 
+
+
+# ---- reading a PDF's text in plain Python (20.19, for contract notes) ----
+def _pdf_objects(raw):
+    """Every object of a PDF by number, including those packed in object
+    streams (PDF 1.5+). Values are the raw bytes between obj and endobj."""
+    objs = {}
+    for m in re.finditer(rb"(\d+)\s+(\d+)\s+obj\b(.*?)\bendobj", raw, re.S):
+        objs[int(m.group(1))] = m.group(3)
+    for k, v in list(objs.items()):
+        if b"/ObjStm" not in v[:400]:
+            continue
+        data = _pdf_stream(v)
+        if not data:
+            continue
+        n = re.search(rb"/N\s+(\d+)", v)
+        first = re.search(rb"/First\s+(\d+)", v)
+        if not n or not first:
+            continue
+        nums = list(map(int, data[:int(first.group(1))].split()))
+        pairs = list(zip(nums[0::2], nums[1::2]))
+        base = int(first.group(1))
+        for j, (onum, off) in enumerate(pairs):
+            end = base + pairs[j + 1][1] if j + 1 < len(pairs) else len(data)
+            objs.setdefault(onum, data[base + off:end])
+    return objs
+
+
+def _pdf_stream(obj):
+    m = re.search(rb"stream\r?\n", obj)
+    if not m:
+        return b""
+    body = obj[m.end():]
+    e = body.rfind(b"endstream")
+    if e >= 0:
+        body = body[:e]
+    if b"/FlateDecode" in obj[:m.start()]:
+        for wb in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+            try:
+                return zlib.decompressobj(wb).decompress(body)
+            except Exception:
+                continue
+        return b""
+    if b"/Filter" in obj[:m.start()]:
+        return b""          # an image or a filter not needed for text
+    return body
+
+
+def _ref(d, key):
+    m = re.search(rb"/" + key + rb"\s+(\d+)\s+\d+\s+R", d)
+    return int(m.group(1)) if m else None
+
+
+def _cmap(data):
+    """A ToUnicode map: glyph code (hex text) -> the characters."""
+    out = {}
+    for blk in re.findall(rb"beginbfchar(.*?)endbfchar", data, re.S):
+        for a, b in re.findall(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>", blk):
+            out[a.decode().upper()] = _u16(b)
+    for blk in re.findall(rb"beginbfrange(.*?)endbfrange", data, re.S):
+        for m in re.finditer(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*"
+                             rb"(<[0-9A-Fa-f]*>|\[[^\]]*\])", blk):
+            lo, hi, w = int(m.group(1), 16), int(m.group(2), 16), m.group(3)
+            width = len(m.group(1))
+            if hi - lo > 5000:
+                continue
+            if w.startswith(b"["):
+                vals = re.findall(rb"<([0-9A-Fa-f]*)>", w)
+                for i, v in enumerate(vals):
+                    out[("%0*X" % (width, lo + i))] = _u16(v)
+            else:
+                start = int(w[1:-1] or b"0", 16)
+                for i in range(hi - lo + 1):
+                    out[("%0*X" % (width, lo + i))] = chr(start + i) \
+                        if start + i < 0x110000 else ""
+    return out
+
+
+def _u16(h):
+    try:
+        return bytes.fromhex(h.decode()).decode("utf-16-be", "replace")
+    except Exception:
+        return ""
+
+
+def _widths(objs, d):
+    """CID -> width (thousandths) from a descendant font's /W array."""
+    w = {}
+    m = re.search(rb"/W\s+(\d+)\s+0\s+R", d)
+    arr = objs.get(int(m.group(1)), b"") if m else b""
+    if not m:
+        m2 = re.search(rb"/W\s*(\[.*\])", d, re.S)
+        arr = m2.group(1) if m2 else b""
+    toks = re.findall(rb"\[|\]|[-\d.]+", arr)
+    i, n = 0, len(toks)
+    if toks and toks[0] == b"[" and arr.strip().startswith(b"["):
+        toks = toks[1:-1]
+        n = len(toks)
+    while i < n:
+        if i + 1 < n and toks[i + 1] == b"[":
+            c = int(float(toks[i]))
+            i += 2
+            while i < n and toks[i] != b"]":
+                w[c] = float(toks[i])
+                c += 1
+                i += 1
+            i += 1
+        elif i + 2 < n:
+            try:
+                a, b, v = int(float(toks[i])), int(float(toks[i + 1])), \
+                    float(toks[i + 2])
+            except ValueError:
+                i += 1
+                continue
+            for c in range(a, min(b, a + 5000) + 1):
+                w[c] = v
+            i += 3
+        else:
+            break
+    return w
+
+
+def _fonts(objs, res):
+    fonts = {}
+    fm = re.search(rb"/Font\s*<<(.*?)>>", res, re.S)
+    if not fm:
+        fr = _ref(res, rb"Font")
+        body = objs.get(fr, b"") if fr else b""
+    else:
+        body = fm.group(1)
+    for name, num in re.findall(rb"/([\w.+-]+)\s+(\d+)\s+0\s+R", body):
+        f = objs.get(int(num), b"")
+        tu = _ref(f, rb"ToUnicode")
+        cm = _cmap(_pdf_stream(objs.get(tu, b""))) if tu else {}
+        two = b"/Type0" in f or b"Identity" in f
+        dw, w = 1000.0, {}
+        dm = re.search(rb"/DescendantFonts\s*\[\s*(\d+)\s+0\s+R", f)
+        if dm:
+            dd = objs.get(int(dm.group(1)), b"")
+            w = _widths(objs, dd)
+            m = re.search(rb"/DW\s+([\d.]+)", dd)
+            dw = float(m.group(1)) if m else 1000.0
+        else:
+            fc = re.search(rb"/FirstChar\s+(\d+)", f)
+            wa = re.search(rb"/Widths\s*\[([^\]]*)\]", f)
+            if fc and wa:
+                for i, v in enumerate(wa.group(1).split()):
+                    w[int(fc.group(1)) + i] = float(v)
+            dw = 500.0
+        fonts[name.decode()] = {"cm": cm, "two": two, "w": w, "dw": dw}
+    return fonts
+
+
+_TOK = re.compile(rb"\((?:\\.|[^\\)])*\)|<[0-9A-Fa-f\s]*>|\[|\]|/[^\s/\[\]()<>]+"
+                  rb"|[-+]?\d*\.?\d+|[A-Za-z'\"*]+")
+
+
+def _lit(b):
+    out, i = bytearray(), 1
+    while i < len(b) - 1:
+        c = b[i]
+        if c == 0x5C:
+            i += 1
+            e = b[i:i + 1]
+            if e and e in b"01234567":
+                j = i
+                while j < min(i + 3, len(b) - 1) and b[j:j + 1] in \
+                        b"01234567":
+                    j += 1
+                out.append(int(b[i:j], 8) & 255)
+                i = j
+                continue
+            out += {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b",
+                    b"f": b"\f"}.get(e, e)
+        else:
+            out.append(c)
+        i += 1
+    return bytes(out)
+
+
+def _decode(s, f):
+    """Glyph codes of one string -> (text, width in thousandths)."""
+    if s.startswith(b"<"):
+        b = bytes.fromhex(re.sub(rb"\s", b"", s[1:-1]).decode() or "")
+    else:
+        b = _lit(s)
+    step = 2 if f and f["two"] else 1
+    txt, wid = "", 0.0
+    for i in range(0, len(b) - step + 1, step):
+        code = int.from_bytes(b[i:i + step], "big")
+        key = "%0*X" % (step * 2, code)
+        if f and f["cm"]:
+            txt += f["cm"].get(key, "")
+        else:
+            txt += chr(code) if step == 1 else ""
+        wid += (f["w"].get(code, f["dw"]) if f else 500.0)
+    return txt, wid
+
+
+def pdf_lines(raw, ytol=2.0):
+    """The text of a PDF as lines, top of each page first, the words of a
+    line in reading order: [[page, y, [(x, text), ...]], ...]. Pure Python
+    so that it works on any computer without installing anything."""
+    objs = _pdf_objects(raw)
+    pages = []
+    kids = [k for k, v in objs.items()
+            if re.search(rb"/Type\s*/Page\b(?!s)", v)]
+    # in the order of the page tree
+    order = []
+    for v in objs.values():
+        if re.search(rb"/Type\s*/Pages\b", v):
+            km = re.search(rb"/Kids\s*\[([^\]]*)\]", v)
+            if km:
+                order += [int(x) for x in re.findall(rb"(\d+)\s+0\s+R",
+                                                      km.group(1))]
+    pages = [k for k in order if k in kids] or sorted(kids)
+    out = []
+    for pno, pk in enumerate(pages):
+        pd = objs[pk]
+        rr = _ref(pd, rb"Resources")
+        res = objs.get(rr, b"") if rr else pd
+        fonts = _fonts(objs, res)
+        cm = re.search(rb"/Contents\s*\[([^\]]*)\]", pd)
+        if cm:
+            cids = [int(x) for x in re.findall(rb"(\d+)\s+0\s+R",
+                                                cm.group(1))]
+        else:
+            c1 = _ref(pd, rb"Contents")
+            cids = [c1] if c1 else []
+        data = b"\n".join(_pdf_stream(objs.get(c, b"")) for c in cids)
+        runs = []
+        ctm = [1, 0, 0, 1, 0, 0]
+        stack = []
+        tm = lm = [1, 0, 0, 1, 0, 0]
+        f, fs, tl, tc, tw, th = None, 1.0, 0.0, 0.0, 0.0, 1.0
+        ops = []
+
+        def mul(a, b):
+            return [a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3],
+                    a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3],
+                    a[4] * b[0] + a[5] * b[2] + b[4],
+                    a[4] * b[1] + a[5] * b[3] + b[5]]
+
+        def show(items):
+            nonlocal tm
+            txt = ""
+            m0 = mul(tm, ctm)
+            x0, y0 = m0[4], m0[5]
+            adv = 0.0
+            for it in items:
+                if isinstance(it, float):
+                    adv -= it / 1000.0 * fs * th
+                    if -it > 250 and txt and not txt.endswith(" "):
+                        txt += " "
+                    continue
+                t, w = _decode(it, f)
+                txt += t
+                adv += (w / 1000.0 * fs + tc * len(t) +
+                        tw * t.count(" ")) * th
+            tm = mul([1, 0, 0, 1, adv, 0], tm)
+            m1 = mul(tm, ctm)
+            if txt.strip():
+                scale = (abs(m0[0]) + abs(m0[3])) / 2 or 1
+                runs.append((round(y0, 1), x0, m1[4], txt, fs * scale))
+        arr = None
+        for tok in _TOK.findall(data):
+            if tok == b"[":
+                arr = []
+                continue
+            if tok == b"]":
+                ops.append(arr)
+                arr = None
+                continue
+            if arr is not None:
+                if tok[:1] in b"(<":
+                    arr.append(tok)
+                else:
+                    try:
+                        arr.append(float(tok))
+                    except ValueError:
+                        pass
+                continue
+            if tok[:1] in b"(<" or tok[:1] == b"/" or \
+                    re.match(rb"[-+]?\d*\.?\d+$", tok):
+                ops.append(tok)
+                continue
+            op = tok
+            a = ops
+            ops = []
+
+            def n(i):
+                try:
+                    return float(a[i])
+                except Exception:
+                    return 0.0
+            if op == b"q":
+                stack.append(ctm[:])
+            elif op == b"Q":
+                ctm = stack.pop() if stack else [1, 0, 0, 1, 0, 0]
+            elif op == b"cm" and len(a) >= 6:
+                ctm = mul([n(-6), n(-5), n(-4), n(-3), n(-2), n(-1)], ctm)
+            elif op == b"BT":
+                tm = lm = [1, 0, 0, 1, 0, 0]
+            elif op == b"Tf" and len(a) >= 2:
+                f = fonts.get(a[-2].decode("latin-1")[1:])
+                fs = n(-1)
+            elif op == b"TL" and a:
+                tl = n(-1)
+            elif op == b"Tc" and a:
+                tc = n(-1)
+            elif op == b"Tw" and a:
+                tw = n(-1)
+            elif op == b"Tz" and a:
+                th = n(-1) / 100.0
+            elif op in (b"Td", b"TD") and len(a) >= 2:
+                if op == b"TD":
+                    tl = -n(-1)
+                lm = mul([1, 0, 0, 1, n(-2), n(-1)], lm)
+                tm = lm
+            elif op == b"Tm" and len(a) >= 6:
+                lm = tm = [n(-6), n(-5), n(-4), n(-3), n(-2), n(-1)]
+            elif op == b"T*":
+                lm = mul([1, 0, 0, 1, 0, -tl], lm)
+                tm = lm
+            elif op == b"Tj" and a:
+                show([a[-1]])
+            elif op == b"TJ" and a and isinstance(a[-1], list):
+                show(a[-1])
+            elif op in (b"'", b'"') and a:
+                lm = mul([1, 0, 0, 1, 0, -tl], lm)
+                tm = lm
+                show([a[-1]])
+        # group runs into lines, top of the page first
+        runs.sort(key=lambda r: (-r[0], r[1]))
+        lines = []
+        for r in runs:
+            if lines and abs(lines[-1][1] - r[0]) <= ytol:
+                lines[-1][2].append(r)
+            else:
+                lines.append([pno, r[0], [r]])
+        for ln in lines:
+            ln[2].sort(key=lambda r: r[1])
+            words = []
+            for r in ln[2]:
+                if words and r[1] - words[-1][2] < 0.25 * r[4]:
+                    words[-1] = (words[-1][0], words[-1][1] + r[3], r[2])
+                else:
+                    words.append((r[1], r[3], r[2]))
+            ln[2] = [(round(w[0], 1), w[1].strip()) for w in words
+                     if w[1].strip()]
+        out += lines
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CONTRACT NOTES (20.19) - a broker's contract note (a PDF, or a photo or
+# screenshot of one) is read, its trades go into the Accounts, and every
+# charge on it is checked against the Accounts' own Charges to the paisa.
+# A difference is shown and nothing is changed: he decides, per charge,
+# whether to correct the formula's rate from that date on (his yes), or to
+# set that note's figure on the row only, or to leave it.
+# The PDF is read here, in plain Python (nothing to install; nothing sent
+# anywhere). A photo or screenshot is read by Gemini, and he confirms every
+# figure before anything is checked or added.
+# ---------------------------------------------------------------------------
+CN_KINDS = [
+    # key, how the line's label starts on the note, name shown. Anchored to
+    # the start: the GST lines mention "Clearing Charges" and "Brok" too
+    ("cgst", r"^\s*cgst\b", "CGST"),
+    ("sgst", r"^\s*sgst\b", "SGST"),
+    ("igst", r"^\s*igst\b", "IGST"),
+    ("brk", r"^\s*(taxable\s+value\s+of\s+supply\s*\(?brokerage|"
+            r"brokerage)", "Brokerage"),
+    ("exchg", r"^\s*(exchange\s+)?transaction\s+charges?|"
+              r"^\s*exchange\s+transaction", "Exchange"),
+    ("clear", r"^\s*clearing\s+charges?", "Clearing"),
+    ("stt", r"^\s*(securities\s+transaction\s+tax|stt\b)", "STT"),
+    ("sebi", r"^\s*sebi\s+(turnover|fee)", "SEBI"),
+    ("stamp", r"^\s*stamp\s+duty", "Stamp duty"),
+    ("payin", r"^\s*pay\s*in\s*/?\s*pay\s*out", "Pay in / pay out"),
+    ("net", r"^\s*net\s+amount", "Net amount"),
+]
+_CN_NUM = re.compile(r"^\(?[-\u2212]?[\d,]*\.?\d+\)?$")
+
+
+def _cn_num(tok):
+    """'(0.23)' -> 0.23 (and paid=True); '7,029.50' -> 7029.5."""
+    t = str(tok or "").strip().replace(",", "").replace("\u2212", "-")
+    paid = t.startswith("(") and t.endswith(")")
+    t = t.strip("()")
+    try:
+        return float(t), paid
+    except ValueError:
+        return None, False
+
+
+def cn_parse(lines):
+    """The lines of a contract note (pdf_lines) -> {date, no, trades,
+    charges, broker}. Built on Zerodha's note; other brokers' notes carry
+    the same labels (SEBI prescribes them), the trades are found by their
+    exchange and buy/sell marks."""
+    out = {"date": "", "no": "", "broker": "", "trades": [], "charges": {},
+           "warn": []}
+    texts = [" ".join(t for _x, t in ln[2]) for ln in lines]
+    for t in texts:
+        if not out["broker"]:
+            m = re.search(r"(zerodha|groww|upstox|angel|dhan|icici|hdfc|"
+                          r"kotak|sharekhan|motilal|5paisa)", t, re.I)
+            if m:
+                out["broker"] = m.group(1).title()
+        if not out["date"] and re.search(r"trade\s+date", t, re.I):
+            m = re.search(r"(\d{2})[/-](\d{2})[/-](\d{4})", t)
+            if m:
+                out["date"] = "%s-%s-%s" % (m.group(3), m.group(2), m.group(1))
+        if not out["no"] and re.search(r"contract\s+note\s+no", t, re.I):
+            m = re.search(r"no\.?\s*:?\s*([A-Z0-9][\w/-]{5,})", t, re.I)
+            if m:
+                out["no"] = m.group(1)
+    # ---- charges: a label, and the last figure on its line (NET TOTAL) ----
+    for ln in lines:
+        toks = [t for _x, t in ln[2]]
+        if len(toks) < 2:
+            continue
+        label = toks[0]
+        val, paid = _cn_num(toks[-1])
+        if val is None:
+            continue
+        for key, pat, _name in CN_KINDS:
+            if key in out["charges"]:
+                continue
+            if re.search(pat, label, re.I):
+                if key == "net":
+                    val = -val if paid else val
+                out["charges"][key] = val
+                break
+    # ---- trades: the exchange-wise annexure (one line per trade) ----
+    fills = []
+    for ln in lines:
+        toks = [t for _x, t in ln[2]]
+        ex = next((i for i, t in enumerate(toks)
+                   if t.upper() in ("NSE", "BSE")), None)
+        if ex is None or ex < 2:
+            continue
+        side = toks[ex - 1].upper()
+        if side not in ("B", "S", "BUY", "SELL"):
+            continue
+        desc = toks[ex - 2]
+        nums = []
+        for t in toks[ex + 1:]:
+            v, _p = _cn_num(t)
+            if v is None:
+                break
+            nums.append(v)
+        if len(nums) < 4:
+            continue
+        qty, brk_u, net_rate, net_total = nums[0], nums[1], nums[2], nums[-1]
+        sym = re.split(r"[/ ]", desc)[0]
+        sym = re.sub(r"-(EQ|BE|BZ|SM|ST|[A-Z]\d?|[A-Z]{1,2})$", "", sym.upper())
+        typ = "BUY" if side.startswith("B") else "SELL"
+        # the trade price: the net rate has the brokerage in it
+        price = net_rate - brk_u if typ == "BUY" else net_rate + brk_u
+        if abs(qty * net_rate - net_total) > max(0.02, 0.0001 * net_total):
+            out["warn"].append("A trade line did not add up (%s %s): "
+                               "check it by hand." % (sym, qty))
+        times = [t for t in toks[:ex] if re.fullmatch(r"\d{2}:\d{2}:\d{2}",
+                                                       t)]
+        order = toks[0] if re.fullmatch(r"\d{6,}", toks[0]) else ""
+        fills.append({"date": out["date"], "sym": sym, "type": typ,
+                      "exch": toks[ex].upper(),
+                      "qty": qty, "price": round(price, 4),
+                      "time": times[-1] if times else "", "order": order})
+    out["trades"] = doc_orders(fills) if fills else []
+    if not out["date"]:
+        out["warn"].append("The trade date was not found on the note.")
+    if not out["trades"]:
+        out["warn"].append("No trades were found on the note.")
+    return out
+
+
+def acc_load_fy(fy):
+    """The accounts of financial year fy, whether it is the year running
+    (accounts.json) or a past one (accounts-2025-26.json)."""
+    cur = acc_load()
+    if cur is not None and (cur.get("fy") or acc_fy_of(
+            datetime.date.today())) == fy:
+        return cur
+    return acc_load(fy)
+
+
+CN_IMG_PROMPT = (
+    "This is a photo or screenshot of an Indian stockbroker's contract note "
+    "(equity cash segment). Read it exactly; do not work anything out and "
+    "do not guess a figure you cannot read - leave it null. Reply with JSON "
+    "only:\n"
+    '{"date":"YYYY-MM-DD","no":"contract note number","broker":"name",'
+    '"trades":[{"sym":"NSE SYMBOL","type":"BUY"|"SELL","exch":"NSE"|"BSE",'
+    '"qty":number,"price":number}],'
+    '"charges":{"brk":n,"exchg":n,"clear":n,"cgst":n,"sgst":n,"igst":n,'
+    '"stt":n,"sebi":n,"stamp":n,"payin":n,"net":n}}\n'
+    "trades: one per order line of the exchange-wise annexure if it is "
+    "shown, else per security; price is the trade price before brokerage. "
+    "charges: the NET TOTAL column, as positive numbers (net: positive when "
+    "receivable by the client, negative when payable).")
+
+
+def cn_from_image(data, mime):
+    if not GEMINI["key"]:
+        return None, ("Reading a photo needs Gemini: set the Ask key in "
+                      "Diagnostics (it is free). A PDF is read without it.")
+    raw, why = gemini_parts([{"text": CN_IMG_PROMPT},
+                             {"inline_data": {"mime_type": mime,
+                                              "data": data}}], timeout=60)
+    if raw is None:
+        return None, "Gemini did not answer (%s)." % why
+    m = re.search(r"\{.*\}", raw, re.S)
+    try:
+        d = json.loads(m.group(0)) if m else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return None, "Gemini's answer could not be read - try a clearer " \
+                     "picture, or the PDF."
+    return cn_clean(d), ""
+
+
+def cn_clean(d):
+    """A note as typed or corrected on the page (or read by Gemini): only
+    the fields we use, numbers as numbers."""
+    def num(v):
+        try:
+            f = float(str(v).replace(",", ""))
+            return f if math.isfinite(f) else None
+        except (TypeError, ValueError):
+            return None
+    out = {"date": str(d.get("date") or "")[:10], "no": str(d.get("no") or "")
+           [:40], "broker": str(d.get("broker") or "")[:30], "trades": [],
+           "charges": {}, "warn": [str(x)[:200] for x in
+                                   (d.get("warn") or [])][:20]}
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", out["date"]):
+        out["date"] = ""
+    for t in (d.get("trades") or [])[:200]:
+        if not isinstance(t, dict):
+            continue
+        sym = re.sub(r"[^A-Z0-9&_-]", "", str(t.get("sym") or "").upper())
+        typ = str(t.get("type") or "").upper()
+        typ = "BUY" if typ.startswith("B") else "SELL" if \
+            typ.startswith("S") else ""
+        qty, price = num(t.get("qty")), num(t.get("price"))
+        if not sym or not typ or not qty or price is None:
+            continue
+        exch = "BSE" if str(t.get("exch") or "").upper().startswith("B") \
+            else "NSE"
+        row = {"sym": sym, "type": typ, "exch": exch, "qty": abs(qty),
+               "price": price, "date": out["date"]}
+        ov = num(t.get("override"))
+        if ov is not None and abs(ov - abs(qty) * price) >= 0.005:
+            row["override"] = ov
+        out["trades"].append(row)
+    for k, _p, _n in CN_KINDS:
+        v = num((d.get("charges") or {}).get(k))
+        if v is not None:
+            out["charges"][k] = v if k == "net" else abs(v)
+    return out
+
+
+# what each charge of the Accounts is worked out on, for the rate shown
+CN_CHECK = [
+    ("brk", "Brokerage", None),
+    ("exchg", "Exchange transaction charges", ("exch_nse", "exch_bse")),
+    ("gst", "GST (CGST + SGST + IGST)", ("gst",)),
+    ("stt", "STT", ("stt_del", "stt_intra")),
+    ("sebi", "SEBI turnover fee", ("sebi",)),
+    ("stamp", "Stamp duty", ("stamp_del", "stamp_intra")),
+]
+
+
+def cn_propose(note, row):
+    """For a charge that differs: the simplest rate that makes the
+    Accounts give the note's figure, and proof - the whole note worked out
+    again with that rate must agree to the paisa on that charge. Nothing is
+    saved. A charge whose base is mixed (NSE and BSE, delivery and
+    intraday) gets no proposal: one note cannot tell which rate is off."""
+    row["propose"] = None
+    if row.get("diff") in (None, 0) or abs(row["diff"]) < 0.005 or \
+            not row.get("rateKey") or not row.get("base"):
+        return
+    k, rk, base, want = row["k"], row["rateKey"], row["base"], row["note"]
+    unit = 1.0 if k in ("stt", "stamp") else 0.01
+    lo, hi = (want - unit / 2) / base, (want + unit / 2) / base
+    if k == "gst":
+        lo, hi = max(lo, 0), min(hi, 0.5)
+    cand = []
+    for sig in range(1, 9):
+        for c in (float("%.*g" % (sig, (lo + hi) / 2)),
+                  float("%.*g" % (sig, lo)), float("%.*g" % (sig, hi))):
+            if lo <= c < hi and c not in cand:
+                cand.append(c)
+        if cand:
+            break
+    tr = _rate_try()
+    for c in cand:
+        tr.clear()
+        tr[rk] = c
+        try:
+            again = cn_check(note)
+        finally:
+            tr.clear()
+        hit = next((x for x in again.get("lines") or [] if x["k"] == k), None)
+        if hit and hit["diff"] is not None and abs(hit["diff"]) < 0.005:
+            row["propose"] = {"key": rk, "name": CHG_RATES[rk][1],
+                              "v": c, "was": chg_rate(rk, note.get("date")),
+                              "from": note.get("date")}
+            return
+
+
+def cn_check(note):
+    """The note's charges beside the Accounts' own for the same day, to the
+    paisa, with the rates. The Accounts are not changed: the trades of the
+    note not yet in them are added to a copy for the working."""
+    d = note.get("date") or ""
+    if not d:
+        return {"ok": False, "error": "The note's trade date is missing - "
+                "type it in the box above."}
+    fy = acc_fy_of(datetime.date.fromisoformat(d))
+    acc = acc_load_fy(fy) or {"tx": []}
+    work = {"tx": [dict(t) for t in acc.get("tx") or []]}
+    have, missing = [], []
+    for o in note.get("trades") or []:
+        o2 = dict(o, date=d)
+        if acc_have(work, o2):
+            have.append(o2)
+        else:
+            missing.append(o2)
+            row = {"date": d, "type": o2["type"], "sym": o2["sym"],
+                   "qty": o2["qty"], "price": o2["price"],
+                   "exch": o2["exch"]}
+            if o2.get("override") is not None:
+                row["override"] = o2["override"]
+            _acc_place(work["tx"], row)
+    acc_mark_intraday(work["tx"], {d})
+    # rows of that day in the Accounts that are not on the note: the day's
+    # STT and stamp duty are worked out over all of them, so the check can
+    # only be exact when the note and the day agree
+    extra = []
+    for t in acc.get("tx") or []:
+        if t.get("date") != d or str(t.get("type") or "").upper() not in \
+                ("BUY", "SELL") or t.get("inst"):
+            continue
+        o = {"date": d, "sym": str(t.get("sym") or "").upper(),
+             "type": str(t.get("type") or "").upper(),
+             "qty": abs(_anum(t.get("qty")) or 0),
+             "price": _anum(t.get("price")) or 0}
+        if not acc_have({"tx": [dict(x, date=d) for x in
+                                note.get("trades") or []]}, o):
+            extra.append(o)
+    v = acc_compute(work, acc_broker(), upto=d)
+    rows = [c for c in v.get("charges") or [] if c.get("d") == d and
+            not c.get("inst")]
+    tot = {k: sum((c.get(k) or 0) for c in rows) for k in
+           ("brk", "exchg", "gst", "stt", "sebi", "stamp", "dp")}
+    turn = {"all": sum(c["e"] for c in rows),
+            "nse": sum(c["e"] for c in rows if c["exch"] == "NSE"),
+            "bse": sum(c["e"] for c in rows if c["exch"] == "BSE"),
+            "del": sum(c["e"] for c in rows if not c["yes"]),
+            "intraSell": sum(c["e"] for c in rows if c["yes"] and
+                             c["type"] == "SELL"),
+            "delBuy": sum(c["e"] for c in rows if not c["yes"] and
+                          c["type"] == "BUY"),
+            "intraBuy": sum(c["e"] for c in rows if c["yes"] and
+                            c["type"] == "BUY")}
+    ch = note.get("charges") or {}
+    note_gst = sum(ch.get(k) or 0 for k in ("cgst", "sgst", "igst")) \
+        if any(k in ch for k in ("cgst", "sgst", "igst")) else None
+    nv = {"brk": ch.get("brk"), "exchg": ch.get("exchg"), "gst": note_gst,
+          "stt": ch.get("stt"), "sebi": ch.get("sebi"),
+          "stamp": ch.get("stamp")}
+    # a charge the note leaves blank (stamp duty on a day of sales only) is
+    # nil on the note
+    for k in nv:
+        if nv[k] is None and ch:
+            nv[k] = 0.0
+    lines = []
+    for k, name, rkeys in CN_CHECK:
+        mine = xround(tot[k], 2)
+        theirs = nv.get(k)
+        row = {"k": k, "name": name, "note": theirs, "mine": mine,
+               "diff": None if theirs is None else round(theirs - mine, 2),
+               "rates": [], "base": None, "implied": None, "rateKey": None}
+        # the base the rate applies to, and the note's own rate on it
+        base, rk = None, None
+        if k == "exchg":
+            if turn["bse"] and not turn["nse"]:
+                base, rk = turn["bse"], "exch_bse"
+            elif turn["nse"] and not turn["bse"]:
+                base, rk = turn["nse"], "exch_nse"
+        elif k == "gst":
+            nb = sum((ch.get(x) or 0) for x in ("brk", "exchg", "sebi",
+                                                 "clear"))
+            base, rk = nb, "gst"
+        elif k == "stt":
+            if turn["del"] and not turn["intraSell"]:
+                base, rk = turn["del"], "stt_del"
+            elif turn["intraSell"] and not turn["del"]:
+                base, rk = turn["intraSell"], "stt_intra"
+        elif k == "sebi":
+            base, rk = turn["all"], "sebi"
+        elif k == "stamp":
+            if turn["delBuy"] and not turn["intraBuy"]:
+                base, rk = turn["delBuy"], "stamp_del"
+            elif turn["intraBuy"] and not turn["delBuy"]:
+                base, rk = turn["intraBuy"], "stamp_intra"
+        for r in rkeys or ():
+            row["rates"].append({"key": r, "name": CHG_RATES[r][1],
+                                 "v": chg_rate(r, d)})
+        if base and theirs is not None:
+            row["base"] = round(base, 2)
+            row["implied"] = theirs / base
+            row["rateKey"] = rk
+        lines.append(row)
+    if (ch.get("clear") or 0) > 0:
+        lines.append({"k": "clear", "name": "Clearing charges", "note":
+                      ch["clear"], "mine": 0.0, "diff": ch["clear"],
+                      "rates": [], "base": None, "implied": None,
+                      "rateKey": None})
+    payin = ch.get("payin")
+    gross_mine = sum((c["e"] if c["type"] == "SELL" else -c["e"])
+                     for c in rows)
+    net_mine = gross_mine - sum(xround(tot[k], 2) for k in (
+        "brk", "exchg", "gst", "stt", "sebi", "stamp"))
+    summary = {"payin": payin, "payinMine": round(abs(gross_mine), 2),
+               "net": ch.get("net"), "netMine": xround(net_mine, 2),
+               "clear": ch.get("clear") or 0,
+               "dpMine": xround(tot["dp"], 2)}
+    if not _rate_try() and not extra:
+        for row in lines:
+            cn_propose(note, row)
+    return {"ok": True, "date": d, "fy": fy, "lines": lines,
+            "accFy": (acc_load() or {}).get("fy") or acc_fy_of(
+                datetime.date.today()),
+            "summary": summary, "have": have, "missing": missing,
+            "extra": extra,
+            "exact": not extra and all(x["diff"] in (0, None) or
+                                       abs(x["diff"]) < 0.005
+                                       for x in lines)}
+
+
 # ---- live prices of every share held -------------------------------------
 
 ACC_Q = {}
@@ -12038,6 +13065,87 @@ def accounts_action(data):
             ui["fyLater"] = acc_fy_of(datetime.date.today())
             acc_ui_save(ui)
             return {"ok": True}
+        if act == "cnote-read":
+            # 20.19: a contract note - PDF read here, a photo by Gemini
+            import base64 as _b64
+            f = data.get("file") or {}
+            try:
+                raw = _b64.b64decode(str(f.get("data") or "").split(",")[-1])
+            except Exception:
+                raw = b""
+            if not raw:
+                return {"ok": False, "error": "Choose the contract note."}
+            if len(raw) > 20 * 1024 * 1024:
+                return {"ok": False, "error": "That file is too big."}
+            if raw[:4] == b"%PDF":
+                if re.search(rb"/Encrypt\b", raw):
+                    return {"ok": False, "error": "This PDF still has its "
+                            "password. Open it (with the password), then "
+                            "File \u2192 Print \u2192 Save as PDF, and "
+                            "choose the new file."}
+                try:
+                    note = cn_parse(pdf_lines(raw))
+                except Exception as e:
+                    return {"ok": False, "error": "The PDF could not be read "
+                            "(%s). A photo or screenshot of it works too."
+                            % str(e)[:80]}
+                src = "pdf"
+            else:
+                mime = str(f.get("mime") or "")
+                if not re.fullmatch(r"image/(png|jpe?g|webp|heic|heif)",
+                                    mime):
+                    return {"ok": False, "error": "Choose the note's PDF, "
+                            "or a photo or screenshot of it."}
+                note, why = cn_from_image(
+                    _b64.b64encode(raw).decode("ascii"), mime)
+                if note is None:
+                    return {"ok": False, "error": why}
+                src = "photo"
+            note = cn_clean(note)
+            chk = cn_check(note) if note.get("date") else \
+                {"ok": False, "error": "The trade date is missing."}
+            return {"ok": True, "note": note, "src": src, "check": chk}
+        if act == "cnote-check":
+            note = cn_clean(data.get("note") or {})
+            return {"ok": True, "note": note, "check": cn_check(note)}
+        if act == "cnote-rate":
+            # his yes to a rate the note shows: from the note's date on
+            key = str(data.get("key") or "")
+            if key not in CHG_RATES:
+                return {"ok": False, "error": "Unknown charge."}
+            try:
+                v = float(data.get("v"))
+            except (TypeError, ValueError):
+                v = -1
+            if not 0 <= v < 1:
+                return {"ok": False, "error": "That rate is not a number "
+                        "between 0 and 100%."}
+            frm = str(data.get("from") or "")
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", frm):
+                return {"ok": False, "error": "The date is missing."}
+            ui = acc_ui()
+            hist = [x for x in (ui.get("rates") or []) if isinstance(x, dict)]
+            rid = hashlib.sha1(("%s%s%s%s" % (key, v, frm, time.time()))
+                               .encode()).hexdigest()[:10]
+            hist.append({"id": rid, "key": key, "v": v, "from": frm,
+                         "was": chg_rate(key, frm),
+                         "note": str(data.get("noteNo") or "")[:40],
+                         "at": time.strftime("%d %b %Y %H:%M")})
+            ui["rates"] = hist
+            acc_ui_save(ui)
+            return {"ok": True, "id": rid, "rates": hist}
+        if act == "cnote-rate-undo":
+            ui = acc_ui()
+            rid = str(data.get("id") or "")
+            hist = [x for x in (ui.get("rates") or []) if isinstance(x, dict)
+                    and x.get("id") != rid]
+            ui["rates"] = hist
+            acc_ui_save(ui)
+            return {"ok": True, "rates": hist}
+        if act == "cnote-rates":
+            return {"ok": True, "rates": acc_ui().get("rates") or [],
+                    "defaults": {k: [v[0], v[1]] for k, v in
+                                 CHG_RATES.items()}}
         if act in ("docs-read", "trades-read"):
             files = data.get("files") or []
             if not isinstance(files, list) or len(files) > 30:
@@ -12167,6 +13275,33 @@ def accounts_action(data):
                 n = acc_mark_intraday(acc["tx"], days)
                 acc_save(acc, "%d trade(s) added from a file" % added)
                 return {"ok": True, "added": added, "intraday": n}
+            if act == "cnote-fix":
+                # 20.19: the note's figure for one charge, on that day's
+                # first trade (the formula is left as it is)
+                d = str(data.get("date") or "")
+                k = str(data.get("k") or "")
+                if k not in ("brk", "exchg", "gst", "stt", "sebi", "stamp"):
+                    return {"ok": False, "error": "Unknown charge."}
+                try:
+                    want = float(data.get("note"))
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "The note's figure is "
+                            "missing."}
+                v = acc_compute(acc, acc_broker())
+                day = [c for c in v.get("charges") or [] if c.get("d") == d
+                       and not c.get("inst")]
+                if not day:
+                    return {"ok": False, "error": "Add the note's trades "
+                            "first."}
+                have = xround(sum((c.get(k) or 0) for c in day), 2)
+                first = day[0]
+                row = acc["tx"][first["tx"]]
+                fix = dict(row.get("chgFix") or {})
+                fix[k] = round((first.get(k) or 0) + (want - have), 6)
+                row["chgFix"] = fix
+                acc_save(acc, "%s on %s set to the contract note's %.2f" %
+                         (k, d, want))
+                return {"ok": True}
             if act == "tx-delete-ids":
                 # 20.14: Today's buys -> UNDO takes out exactly the rows it
                 # put in, whatever was typed since
@@ -13279,11 +14414,19 @@ def portfolio_shares_line(slab, skip=()):
     today = datetime.date.today()
     inv = cur = stg = ltg = 0.0
     held_vals = []
+    unpriced = []
+    live = in_market_hours()
     for sym, lots in (v.get("parcels") or {}).items():
         if sym.upper() in skip:
             continue
         q = snap.get(sym) or {}
         ltp = to_number(q.get("ltpNum") or q.get("ltp"))
+        # 20.19: a price not read lately in market hours is not today's -
+        # the share is counted at cost and NAMED, never passed off as valued
+        if ltp and live and time.time() - (q.get("at") or 0) > 900:
+            ltp = None
+        if not ltp and lots:
+            unpriced.append(sym)
         for d0, qty, price in lots:
             c = qty * price
             inv += c
@@ -13311,7 +14454,12 @@ def portfolio_shares_line(slab, skip=()):
             "12.5% on long-term over what is left of the ₹1.25 lakh "
             "this year, + cess; losses not set off",
             "final": round(cur - tax * 1.04, 2), "end": "", "start": "",
-            "cagr": None, "liquid": "liquid", "held": held_vals}
+            "cagr": None, "liquid": "liquid", "held": held_vals,
+            "unpriced": sorted(unpriced),
+            "error": ("could not fetch the latest price of %s - counted at "
+                      "what was paid" % ", ".join(sorted(unpriced)))
+            if unpriced else "",
+            "cash": round((dash.get("cash") or 0), 2)}
 
 
 def portfolio_view():
@@ -13367,7 +14515,17 @@ def portfolio_view():
         sh["tax"] = 0.0
         sh["taxHow"] = ("nil: your income is below the taxable limit (while "
                         "the total, these gains included, stays below it)")
-    allr = ([sh] if sh else []) + rows
+    # 20.19: the money lying with the broker is part of what he owns
+    cashr = None
+    if sh and abs(sh.get("cash") or 0) >= 0.005:
+        c = sh["cash"]
+        cashr = {"id": "_cash", "type": "cash", "typeName": "Cash",
+                 "name": "Cash with the broker (Accounts → cash balance)",
+                 "broker": "", "invested": c, "current": c, "gain": 0.0,
+                 "interest": 0.0, "maturity": None, "expected": 0.0,
+                 "tax": 0.0, "taxHow": "cash - no tax", "final": c,
+                 "end": "", "start": "", "cagr": None, "liquid": "liquid"}
+    allr = ([sh] if sh else []) + ([cashr] if cashr else []) + rows
     tot = {k: round(sum((r.get(k) or 0) for r in allr), 2) for k in
            ("invested", "current", "gain", "interest", "expected")}
     unknown = any(r.get("tax") is None and r.get("taxHow") for r in allr)
@@ -13582,11 +14740,18 @@ def portfolio_day_mark():
         return
     if not v["rows"]:
         return
+    # 20.19: a day when a share could not be priced is not marked (the
+    # point would be wrong), and the broker's cash - now a row of its own -
+    # stays out of the line, which has always been the investments alone
+    if any(r.get("unpriced") for r in v["rows"]):
+        return
+    cash = sum(r.get("current") or 0 for r in v["rows"]
+               if r.get("id") == "_cash")
     d = portfolio_load()
     day = datetime.date.today().isoformat()
     h = [x for x in d.get("history") or [] if x.get("d") != day]
-    h.append({"d": day, "inv": v["totals"]["invested"],
-              "cur": v["totals"]["current"]})
+    h.append({"d": day, "inv": round(v["totals"]["invested"] - cash, 2),
+              "cur": round(v["totals"]["current"] - cash, 2)})
     d["history"] = h[-1500:]
     portfolio_save(d)
 
@@ -14045,32 +15210,155 @@ def tv_live(handle):
     return out
 
 
-def tv_search(q):
-    """Live videos for a search (the first ten)."""
+# 20.17: YouTube's own page data (ytInitialData) read properly - search
+# results of every kind (not only live, which is why a channel he knows
+# "had no results"), the channels that match, and a channel's own videos
+def _yt_data(raw):
+    m = re.search(r"var ytInitialData\s*=\s*(\{.*?\});\s*</script>", raw, re.S) \
+        or re.search(r'window\["ytInitialData"\]\s*=\s*(\{.*?\});', raw, re.S)
+    try:
+        return json.loads(m.group(1)) if m else {}
+    except ValueError:
+        return {}
+
+
+def _yt_walk(o, key, out):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k == key and isinstance(v, dict):
+                out.append(v)
+            else:
+                _yt_walk(v, key, out)
+    elif isinstance(o, list):
+        for v in o:
+            _yt_walk(v, key, out)
+    return out
+
+
+def _yt_t(x):
+    if not isinstance(x, dict):
+        return ""
+    if "simpleText" in x:
+        return str(x["simpleText"])
+    if "content" in x and isinstance(x["content"], str):
+        return x["content"]
+    return "".join(str(r.get("text", "")) for r in x.get("runs") or [])
+
+
+def _yt_videos(d, n=30):
+    out, seen = [], set()
+    for v in _yt_walk(d, "videoRenderer", []):
+        vid = v.get("videoId")
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        ln = _yt_t(v.get("lengthText"))
+        out.append({"id": vid, "title": _yt_t(v.get("title"))[:140],
+                    "channel": _yt_t(v.get("ownerText") or
+                                     v.get("longBylineText"))[:60],
+                    "len": ln, "when": _yt_t(v.get("publishedTimeText")),
+                    "live": not ln and "LIVE" in json.dumps(
+                        v.get("badges") or []) + json.dumps(
+                        v.get("thumbnailOverlays") or [])})
+    # the newer layout (channel pages): "lockup" items
+    for lk in _yt_walk(d, "lockupViewModel", []):
+        vid = lk.get("contentId")
+        if lk.get("contentType") != "LOCKUP_CONTENT_TYPE_VIDEO" or not vid \
+                or vid in seen:
+            continue
+        seen.add(vid)
+        md = (lk.get("metadata") or {}).get("lockupMetadataViewModel") or {}
+        parts = [_yt_t(p.get("text")) for r in (((md.get("metadata") or {})
+                 .get("contentMetadataViewModel") or {}).get("metadataRows")
+                 or []) for p in r.get("metadataParts") or []]
+        badge = [b.get("thumbnailBadgeViewModel", {}).get("text", "") for b in
+                 _yt_walk(lk.get("contentImage") or {},
+                          "thumbnailBottomOverlayViewModel", [])
+                 for b in (b.get("badges") or [])]
+        ln = next((b for b in badge if re.match(r"^\d+(:\d\d)+$", b)), "")
+        out.append({"id": vid, "title": _yt_t(md.get("title"))[:140],
+                    "channel": "", "len": ln,
+                    "when": next((p for p in parts if "ago" in p), ""),
+                    "live": any("LIVE" in b.upper() for b in badge)})
+    return out[:n]
+
+
+def _yt_channels(d, n=6):
+    out = []
+    for c in _yt_walk(d, "channelRenderer", []):
+        cid = c.get("channelId")
+        url = (((c.get("navigationEndpoint") or {}).get("browseEndpoint") or
+                {}).get("canonicalBaseUrl") or "")
+        if cid:
+            out.append({"id": cid, "title": _yt_t(c.get("title"))[:60],
+                        "handle": url.strip("/") if url.startswith("/@")
+                        else "channel/" + cid,
+                        "subs": _yt_t(c.get("videoCountText") or
+                                      c.get("subscriberCountText"))})
+        if len(out) >= n:
+            break
+    return out
+
+
+def tv_search(q, live=False):
+    """20.17: everything a YouTube search turns up - matching channels and
+    up to 30 videos of every kind (live only when asked)."""
     q = str(q or "").strip()[:80]
     if not q:
         return {"ok": False, "error": "Type what to look for"}
     try:
-        raw = _yt_get("https://www.youtube.com/results?search_query=" +
-                      Q(q) + "&sp=EgJAAQ%253D%253D")
+        raw = _yt_get("https://www.youtube.com/results?search_query=" + Q(q)
+                      + ("&sp=EgJAAQ%253D%253D" if live else ""))
     except Exception as e:
         return {"ok": False, "error": "YouTube did not answer (%s)" %
                 str(e)[:60]}
-    out, seen = [], set()
-    for m in re.finditer(r'"videoRenderer":\{"videoId":"([\w-]{11})".{0,1500}?'
-                         r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"',
-                         raw, re.S):
-        if m.group(1) in seen:
-            continue
-        seen.add(m.group(1))
+    d = _yt_data(raw)
+    return {"ok": True, "channels": [] if live else _yt_channels(d),
+            "items": _yt_videos(d)}
+
+
+def tv_channel(ch):
+    """20.17: a channel's latest videos (and what it has live now). `ch` is
+    @name or channel/UC... ; an @name YouTube will not show is looked up
+    by search and opened by its channel id instead."""
+    h = str(ch or "").strip().strip("/")
+    h = re.sub(r"^https?://(www\.)?youtube\.com/", "", h).split("/videos")[0]
+    if not re.fullmatch(r"@[\w.-]{2,60}|channel/UC[\w-]{20,30}", h):
+        return {"ok": False, "error": "Give a channel as @name"}
+    hit = TV_CACHE.get("v:" + h)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    d, tries = {}, [h]
+    if h.startswith("@"):
+        live = tv_live(h)
+        if live.get("channelId"):
+            tries.append("channel/" + live["channelId"])
+    for t in tries:
         try:
-            title = json.loads('"%s"' % m.group(2))
-        except ValueError:
-            title = m.group(2)
-        out.append({"id": m.group(1), "title": title[:120]})
-        if len(out) >= 10:
+            d = _yt_data(_yt_get("https://www.youtube.com/%s/videos" % t))
+        except Exception:
+            d = {}
+        if d:
             break
-    return {"ok": True, "items": out}
+    if not d and h.startswith("@"):
+        try:
+            c = _yt_channels(_yt_data(_yt_get(
+                "https://www.youtube.com/results?search_query=" +
+                Q(h[1:]))))
+            if c:
+                d = _yt_data(_yt_get("https://www.youtube.com/channel/%s/videos"
+                                     % c[0]["id"]))
+        except Exception:
+            d = {}
+    if not d:
+        return {"ok": False, "error": "YouTube did not show that channel"}
+    title = ""
+    md = _yt_walk(d, "channelMetadataRenderer", [])
+    if md:
+        title = str(md[0].get("title") or "")[:60]
+    out = {"ok": True, "title": title, "items": _yt_videos(d)}
+    TV_CACHE["v:" + h] = (time.time(), out)
+    return out
 
 
 # =========================================================================
@@ -14169,8 +15457,33 @@ def screener_company(sym):
                "shareholding": _scr_table(raw, "quarterly-shp", 8),
                "concalls": calls,
                "url": "https://www.screener.in/company/%s/%s" % (sym, tail)}
+        # 20.19: the direct competitors, as Screener lists them
+        wid = re.search(r'data-warehouse-id="(\d+)"', raw)
+        if wid:
+            try:
+                pr = _tt_get("https://www.screener.in/api/company/%s/peers/"
+                             % wid.group(1), timeout=15)
+                out["peers"] = _scr_peers(pr)
+            except Exception as e:
+                out["peersErr"] = str(e)[:80]
         break
     return out
+
+
+def _scr_peers(raw):
+    """Screener's peer table: name, price, P/E, market cap, dividend yield,
+    the quarter's profit and sales and their growth, ROCE."""
+    heads = [_txt(x) for x in re.findall(r"<th[^>]*>(.*?)</th>", raw, re.S)]
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", raw, re.S):
+        cells = [_txt(c) for c in re.findall(r"<td[^>]*>(.*?)</td>", tr,
+                                             re.S)]
+        if len(cells) < 4:
+            continue
+        link = re.search(r'href="/company/([^/"]+)/', tr)
+        rows.append({"cells": cells, "sym": link.group(1).upper()
+                     if link else ""})
+    return {"heads": heads, "rows": rows[:12]} if rows else None
 
 
 def _nse_rows(url, ref):
@@ -14315,14 +15628,121 @@ def company_info(sym):
     return out
 
 
-def ask_gemini_web(q, timeout=40):
+GEM_NOSEARCH = {"until": 0}
+
+
+def _news_search(term, n=10):
+    """Google News for a search term: [(title, link, source, date)]."""
+    out = []
+    url = ("https://news.google.com/rss/search?q=" + urllib.parse.quote(
+        term) + "&hl=en-IN&gl=IN&ceid=IN:en")
+    raw = urllib.request.urlopen(urllib.request.Request(
+        url, headers={"User-Agent": UA}), timeout=12).read()
+    for it in ET.fromstring(raw).iter("item"):
+        t = (it.findtext("title") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        if src and t.endswith(" - " + src):
+            t = t[:-len(src) - 3]
+        if t:
+            out.append((t, (it.findtext("link") or "").strip(), src,
+                        (it.findtext("pubDate") or "")[5:16]))
+        if len(out) >= n:
+            break
+    return out
+
+
+ECON_CAL = {"at": 0, "rows": []}
+
+
+def econ_calendar(days=7):
+    """20.17: the world's data releases and central-bank meetings for the
+    next `days` days, in Indian time - from the free public feed behind
+    Forex Factory's calendar (this week and, once published, next week).
+    Indian events are not in it; the calendar question adds them from the
+    news."""
+    if time.time() - ECON_CAL["at"] > 3 * 3600:
+        rows = []
+        for wk in ("thisweek", "nextweek"):
+            try:
+                raw = urllib.request.urlopen(urllib.request.Request(
+                    "https://nfs.faireconomy.media/ff_calendar_%s.json" % wk,
+                    headers={"User-Agent": UA}), timeout=12).read()
+                rows += json.loads(raw.decode("utf-8", "replace"))
+            except Exception:
+                pass
+        if rows:
+            ECON_CAL.update(at=time.time(), rows=rows)
+        else:
+            # the feed allows only occasional reads: try again in 10 minutes
+            ECON_CAL["at"] = time.time() - 3 * 3600 + 600
+    ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    now = datetime.datetime.now(ist)
+    out, seen = [], set()
+    for r in ECON_CAL["rows"]:
+        if r.get("impact") not in ("High", "Medium") or r.get("country") not in (
+                "USD", "EUR", "GBP", "JPY", "CNY", "INR"):
+            continue
+        try:
+            t = datetime.datetime.fromisoformat(str(r.get("date"))).astimezone(ist)
+        except ValueError:
+            continue
+        k = (r.get("title"), r.get("country"), t)
+        if k in seen or not now - datetime.timedelta(hours=2) <= t <= \
+                now + datetime.timedelta(days=days):
+            continue
+        seen.add(k)
+        out.append({"when": t.strftime("%a %d %b %H:%M"), "ts": t.timestamp(),
+                    "country": r.get("country"), "what": r.get("title"),
+                    "impact": r.get("impact"),
+                    "forecast": r.get("forecast") or "",
+                    "previous": r.get("previous") or ""})
+    return sorted(out, key=lambda x: x["ts"])
+
+
+def ask_gemini_searched(q, term, extra=""):
+    """20.17: Google stopped giving free keys any Gemini-with-Google-Search
+    (every model answers 429 "check your plan and billing" - tested 6 Nov).
+    So the dashboard searches itself and gives the dated results to plain
+    Gemini, which works. (text, sources, error)"""
+    try:
+        res = _news_search(term)
+    except Exception as e:
+        res = []
+        if not extra:
+            return None, [], "search failed: %s" % str(e)[:60]
+    if not res and not extra:
+        return None, [], "nothing found for that in the news"
+    lines = "\n".join("- %s (%s, %s)" % (t, s or "news", d)
+                      for t, _l, s, d in res)
+    text, why = ask_gemini(
+        "Using ONLY these recent news results (each with its source and "
+        "date), give the most useful answer they support. Lead with the "
+        "specifics they DO contain - each broker's rating and target, each "
+        "event with its date, each figure with its date - as a short list. "
+        "Do not start by saying what is missing; if something asked for is "
+        "not in them, add one short line at the end saying so. Never add "
+        "figures that are not in the results. No bold or other markdown."
+        "\n\nQuestion: %s\n\nNews results:\n%s%s" % (
+            q, lines, ("\n\nAlso known from the dashboard:\n" + extra)
+            if extra else ""), "")
+    src = [{"title": ("%s (%s)" % (t, s))[:80], "url": l}
+           for t, l, s, _d in res if l][:6]
+    return text, src, why
+
+
+def ask_gemini_web(q, timeout=40, search=None, extra=""):
     """Gemini with Google Search (grounding): the answer and the pages it
-    used. (text, sources, error)."""
+    used. (text, sources, error). 20.17: when Google refuses the search
+    (free keys no longer get it), `search` - a short search term - is
+    looked up by the dashboard itself instead."""
     if not GEMINI["key"]:
         return None, [], "no Gemini key"
-    last = ""
-    for model in [GEMINI["model"]] + [m for m in GEMINI_MODELS
-                                      if m != GEMINI["model"]]:
+    if time.time() < GEM_NOSEARCH["until"]:
+        if search:
+            return ask_gemini_searched(q, search, extra)
+        return None, [], "Google search answers are not included in the free Gemini key"
+    last, quota = "", 0
+    for model in gem_order()[:5]:
         body = json.dumps({"contents": [{"parts": [{"text": q}]}],
                            "tools": [{"google_search": {}}]})
         req = urllib.request.Request(
@@ -14336,11 +15756,18 @@ def ask_gemini_web(q, timeout=40):
         except urllib.error.HTTPError as e:
             last = "quota used up for now" if e.code == 429 else \
                 "Gemini error %s" % e.code
+            gem_mark(model, last)
             if e.code in (401, 403):
                 break
+            if e.code == 429:
+                quota += 1
+                if quota >= 2:           # the search itself is refused
+                    GEM_NOSEARCH["until"] = time.time() + 6 * 3600
+                    break
             continue
         except Exception as e:
             last = str(e)[:80]
+            gem_mark(model, last)
             continue
         c = (d.get("candidates") or [{}])[0]
         text = " ".join(p.get("text", "") for p in (
@@ -14360,6 +15787,8 @@ def ask_gemini_web(q, timeout=40):
                 pass
             return text, src[:6], ""
         last = "empty answer"
+    if search:
+        return ask_gemini_searched(q, search, extra)
     return None, [], last
 
 
@@ -14393,7 +15822,62 @@ def company_ask(sym, kind):
          " Use Google Search. Answer in under 150 words, plain English, a "
          "short list where it helps. Give dates for every figure. If you "
          "cannot find reliable current figures, say so - never guess.")
-    text, src, err = ask_gemini_web(q)
+    # 20.17: searched by the dashboard itself (see ask_gemini_searched):
+    # recent news only, worded the way such stories are headlined
+    short = re.sub(r"\s+(limited|ltd\.?|industries)$", "", str(name),
+                   flags=re.I).strip() or sym
+    term = {"consensus": '"%s" target price brokerage when:45d',
+            "mf": '"%s" mutual fund stake when:90d',
+            "concall": '"%s" earnings call management guidance when:100d',
+            "screens": '"%s" stock ROCE debt valuation when:90d',
+            "calendar": "market week ahead key events India RBI Fed data "
+                        "when:7d"}[kind]
+    extra = ""
+    if kind == "calendar":
+        # 20.17: the world's dated events are SHOWN as they are (a list
+        # needs no rewording - Gemini left them out); Gemini only picks the
+        # Indian events out of this week's news
+        cal = econ_calendar()
+        names = {"USD": "US", "EUR": "Euro area", "GBP": "UK", "JPY": "Japan",
+                 "CNY": "China", "INR": "India"}
+        world = "\n".join("\u2022 %s \u2014 %s %s%s%s" % (
+            c["when"], names.get(c["country"], c["country"]), c["what"],
+            " (forecast %s, previous %s)" % (c["forecast"] or "-",
+                                             c["previous"] or "-")
+            if c["forecast"] or c["previous"] else "",
+            " \u2605" if c["impact"] == "High" else "") for c in cal[:30])
+        itext, isrc, _ie = ask_gemini_searched(
+            "List ONLY scheduled Indian economic events in the next 7 days "
+            "from today (%s) - data releases (CPI, WPI, IIP, GDP, trade, "
+            "PMI), RBI meetings, big government dates - each with its date. "
+            "If none are in the results, answer exactly: none found." %
+            datetime.date.today().isoformat(),
+            "India CPI OR WPI OR IIP OR GDP OR PMI OR RBI data release date "
+            "this week when:7d")
+        itext = (itext or "").strip()
+        india = itext if itext and "none found" not in itext.lower() else \
+            "No scheduled Indian data found in this week's news."
+        if not cal and not itext:
+            return {"ok": False, "error": "The calendar feed and the news "
+                    "search both failed just now - try again in a few minutes."}
+        return {"ok": True, "text": ("WORLD (Indian time, \u2605 = high "
+                                     "impact):\n" + (world or "Not available "
+                                                      "just now.") +
+                                     "\n\nINDIA:\n" + india)[:2500],
+                "sources": [{"title": "Economic calendar (Forex Factory feed)",
+                             "url": "https://www.forexfactory.com/calendar"}]
+                + isrc[:4]}
+    if kind == "consensus":
+        try:
+            r = (RECO.get("map") or {}).get(sym) or {}
+            if r.get("call"):
+                extra = "Latest broker call: %s %s, target %s (%s, %s)" % (
+                    r.get("house") or "", r.get("call"), r.get("target") or
+                    "-", r.get("on") or "", r.get("src") or "")
+        except Exception:
+            extra = ""
+    text, src, err = ask_gemini_web(q, search=(term % short) if "%s" in term
+                                    else term, extra=extra)
     if not text:
         return {"ok": False, "error": err or "No answer"}
     return {"ok": True, "text": text[:2500], "sources": src}
@@ -15514,7 +16998,76 @@ def tax_api(data):
         return tax_classify(data.get("text"))
     if act == "ask":
         return tax_ask(data.get("q"), fy)
+    if act == "harvest":
+        return tax_harvest(fy)
     return {"ok": False, "error": "Unknown action"}
+
+
+def tax_harvest(fy=None):
+    """20.19: TAX-LOSS HARVESTING. Shown only when it can save tax: the
+    year's computation has tax to pay, and the shares have short-term gains
+    taxed this year or long-term gains above the Rs 1.25 lakh that is free.
+    Then every parcel held at a loss is listed with what selling it would
+    save - a short-term loss sets off short-term gains first (20%), then
+    long-term (12.5%); a long-term loss only long-term gains. Prices are
+    the latest read; in market hours one not read in the last 15 minutes
+    is left out and named."""
+    tc = tax_compute(fy)
+    if not tc.get("supported"):
+        return {"ok": True, "show": False, "why": tc.get("error") or ""}
+    acc, v = acc_view()
+    if not v:
+        return {"ok": True, "show": False, "why": "No Accounts yet."}
+    cg = v.get("cg") or {}
+    st = max(0.0, cg.get("stcgAfterSetoff") or 0)
+    lt_over = max(0.0, (cg.get("ltcgAfterSetoff") or 0) - 125000.0)
+    payable = (tc.get("totalTax") or 0) > 0
+    base = {"ok": True, "stcg": round(st, 2), "ltcgOver": round(lt_over, 2),
+            "payable": payable, "totalTax": tc.get("totalTax"),
+            "filled": tc.get("filled")}
+    if not payable or (st <= 0 and lt_over <= 0):
+        return dict(base, show=False, why=(
+            "No tax to pay this year on the computation" if not payable else
+            "No short-term gain, and long-term gains within the Rs 1.25 lakh "
+            "that is free") + " - selling at a loss would save nothing now.")
+    with CACHE_LOCK:
+        snap = {k: dict(q) for k, q in CACHE.items() if isinstance(q, dict)}
+    today = datetime.date.today()
+    live = in_market_hours()
+    rows, unread = [], []
+    for sym, lots in (v.get("parcels") or {}).items():
+        q = snap.get(sym) or {}
+        ltp = to_number(q.get("ltpNum") or q.get("ltp"))
+        if not ltp or (live and time.time() - (q.get("at") or 0) > 900):
+            unread.append(sym)
+            continue
+        for d0, qty, price in lots:
+            loss = (ltp - price) * qty
+            if loss >= -0.005:
+                continue
+            d = _pdate(d0, today)
+            rows.append({"sym": sym, "bought": d.isoformat(), "qty": qty,
+                         "price": price, "ltp": ltp, "loss": round(-loss, 2),
+                         "lt": (today - d).days > 365})
+    rows.sort(key=lambda r: -r["loss"])
+    st_left, lt_left = st, lt_over
+    for r in rows:                      # biggest losses first
+        save = 0.0
+        if not r["lt"]:
+            use = min(r["loss"], st_left)
+            st_left -= use
+            save += use * 0.20
+            rest = r["loss"] - use
+            use2 = min(rest, lt_left)
+            lt_left -= use2
+            save += use2 * 0.125
+        else:
+            use = min(r["loss"], lt_left)
+            lt_left -= use
+            save += use * 0.125
+        r["saves"] = round(save * 1.04, 2)
+    return dict(base, show=True, rows=rows, unread=sorted(unread),
+                at=time.strftime("%d %b %Y %H:%M"), live=live)
 
 
 def tax_year_total():
@@ -16366,13 +17919,162 @@ def why_key(pct):
         str(int(abs(pct)))
 
 
+WHY_MAX_ASKS = 4          # 20.17: questions per index per session, at most
+
+# 20.18: each market's own trading hours, in its own time zone (so the
+# changes to and from summer time are followed by themselves). The reason
+# for a move is asked ONLY while that market is trading - asking at night
+# brings the same answer again. India: 9:15 to 3:15 (after that it is the
+# closing auction, the market no longer moves on news). Markets that trade
+# round the clock (currencies, oil, metals, bonds) are open from Sunday 6 pm
+# to Friday 5 pm New York time, less the daily 5-6 pm break; crypto always.
+WHY_SESSIONS = {
+    "NIFTY 50": ("Asia/Kolkata", "09:15", "15:15"),
+    "SENSEX": ("Asia/Kolkata", "09:15", "15:15"),
+    "INDIA VIX": ("Asia/Kolkata", "09:15", "15:15"),
+    "INDIA 10Y": ("Asia/Kolkata", "09:00", "17:00"),
+    "NASDAQ": ("America/New_York", "09:30", "16:00"),
+    "S&P 500": ("America/New_York", "09:30", "16:00"),
+    "DOW": ("America/New_York", "09:30", "16:00"),
+    "RUSSELL 2000": ("America/New_York", "09:30", "16:00"),
+    "TSX": ("America/Toronto", "09:30", "16:00"),
+    "BOVESPA": ("America/Sao_Paulo", "10:00", "17:00"),
+    "IPC": ("America/Mexico_City", "08:30", "15:00"),
+    "FTSE": ("Europe/London", "08:00", "16:30"),
+    "DAX": ("Europe/Berlin", "09:00", "17:30"),
+    "CAC": ("Europe/Paris", "09:00", "17:30"),
+    "EURO STOXX 50": ("Europe/Berlin", "09:00", "17:30"),
+    "AEX": ("Europe/Amsterdam", "09:00", "17:30"),
+    "IBEX": ("Europe/Madrid", "09:00", "17:30"),
+    "FTSE MIB": ("Europe/Rome", "09:00", "17:30"),
+    "SMI": ("Europe/Zurich", "09:00", "17:30"),
+    "OMX 30": ("Europe/Stockholm", "09:00", "17:30"),
+    "BEL 20": ("Europe/Brussels", "09:00", "17:30"),
+    "NIKKEI": ("Asia/Tokyo", "09:00", "15:30"),
+    "HANG SENG": ("Asia/Hong_Kong", "09:30", "16:00"),
+    "SHANGHAI": ("Asia/Shanghai", "09:30", "15:00"),
+    "SHENZHEN": ("Asia/Shanghai", "09:30", "15:00"),
+    "KOSPI": ("Asia/Seoul", "09:00", "15:30"),
+    "TAIWAN": ("Asia/Taipei", "09:00", "13:30"),
+    "STRAITS TIMES": ("Asia/Singapore", "09:00", "17:00"),
+    "ASX 200": ("Australia/Sydney", "10:00", "16:00"),
+    "NZX 50": ("Pacific/Auckland", "10:00", "16:45"),
+    "KLCI": ("Asia/Kuala_Lumpur", "09:00", "17:00"),
+    "SET": ("Asia/Bangkok", "10:00", "16:30"),
+    "PSEI": ("Asia/Manila", "09:30", "15:00"),
+    "VN INDEX": ("Asia/Ho_Chi_Minh", "09:00", "15:00"),
+    "TA-125": ("Asia/Jerusalem", "10:00", "17:25"),
+    "DFM": ("Asia/Dubai", "10:00", "15:00"),
+}
+WHY_GROUP_SESSIONS = {
+    "Currencies": ("America/New_York", "fx", ""),
+    "Commodities": ("America/New_York", "fx", ""),
+    "Bonds": ("America/New_York", "fx", ""),
+    "Crypto": ("UTC", "00:00", "24:00", "all"),
+}
+# the rupee pairs: India's currency market hours
+for _c in INDEX_CATALOG:
+    if _c[2] == "Currencies" and (_c[0].endswith("/INR") or
+                                  _c[0] == "\u00a51 = \u20b9"):
+        WHY_SESSIONS.setdefault(_c[0], ("Asia/Kolkata", "09:00", "17:00"))
+# standard offsets (hours), used only where the computer has no time-zone
+# database (Windows without the tzdata package): summer time is then
+# ignored, at worst an hour out
+WHY_TZ_FALLBACK = {
+    "Asia/Kolkata": 5.5, "America/New_York": -5, "America/Toronto": -5,
+    "America/Sao_Paulo": -3, "America/Mexico_City": -6, "Europe/London": 0,
+    "Europe/Berlin": 1, "Europe/Paris": 1, "Europe/Amsterdam": 1,
+    "Europe/Madrid": 1, "Europe/Rome": 1, "Europe/Zurich": 1,
+    "Europe/Stockholm": 1, "Europe/Brussels": 1, "Asia/Tokyo": 9,
+    "Asia/Hong_Kong": 8, "Asia/Shanghai": 8, "Asia/Seoul": 9,
+    "Asia/Taipei": 8, "Asia/Singapore": 8, "Australia/Sydney": 10,
+    "Pacific/Auckland": 12, "Asia/Kuala_Lumpur": 8, "Asia/Bangkok": 7,
+    "Asia/Manila": 8, "Asia/Ho_Chi_Minh": 7, "Asia/Jerusalem": 2,
+    "Asia/Dubai": 4, "UTC": 0}
+
+
+def _why_now(tzname):
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo(tzname))
+    except Exception:
+        off = WHY_TZ_FALLBACK.get(tzname, 0)
+        return datetime.datetime.now(datetime.timezone(
+            datetime.timedelta(hours=off)))
+
+
+def why_session(label):
+    """20.18: (trading now?, the date of its latest session) in the
+    market's own time. Before the open, the latest session is the previous
+    weekday's - so a US session that runs past midnight in India keeps
+    one date from start to finish."""
+    c = INDEX_BY.get(label)
+    s = WHY_SESSIONS.get(label) or WHY_GROUP_SESSIONS.get(
+        c[2] if c else "") or ("Asia/Kolkata", "09:15", "15:15")
+    every_day = len(s) > 3 and s[3] == "all"
+    now = _why_now(s[0])
+    if s[1] == "fx":
+        # a session starts at 6 pm New York time: moved six hours on, each
+        # session falls on one weekday, and the daily break is 11 pm-midnight
+        sh = now + datetime.timedelta(hours=6)
+        trading_day = sh.weekday() < 5
+        d = sh.date()
+        while d.weekday() >= 5:
+            d -= datetime.timedelta(days=1)
+        return trading_day and sh.hour != 23, d.isoformat()
+    hm = now.strftime("%H:%M")
+    trading_day = every_day or now.weekday() < 5
+    if label in INDIA_INDICES and not is_trading_day():
+        trading_day = False
+    open_now = trading_day and s[1] <= hm < s[2]
+    d = now.date()
+    if not (trading_day and hm >= s[1]):
+        d -= datetime.timedelta(days=1)
+        while not every_day and d.weekday() >= 5:
+            d -= datetime.timedelta(days=1)
+    return open_now, d.isoformat()
+
+
+def why_due(label, pct, stale=False):
+    """20.17: whether Gemini is asked (again) why this index moved. 2 Nov:
+    152 questions for 22 different moves, because the Nasdaq going -3.98%,
+    -4.02%, -3.99% changed the old key every time. Now asked on the first
+    move of the day, again only when the move reaches a NEW whole % (never
+    for going back), or turns round by at least 1%; when Gemini was busy,
+    again after 15 minutes; never more than WHY_MAX_ASKS a day."""
+    w = INDEX_WHY.get(label) or {}
+    now = time.time()
+    open_now, sday = why_session(label)
+    if w.get("pending") and now - w.get("at", 0) < 300:
+        return False
+    if w.get("day") != sday:
+        # 20.18: nothing asked yet for this session. While it trades: its
+        # first real move. After the close: ONCE, for the finished session
+        # (when the dashboard was not open while it traded) - never again
+        if w.get("why") and label in INDIA_INDICES and \
+                not is_trading_day():
+            return False             # an Indian holiday: last session holds
+        return True
+    if not open_now:
+        # closed: only a failed question is tried again, at most once more
+        return bool(w.get("fail")) and (w.get("asks") or 0) < 2 and \
+            now - w.get("at", 0) > 900
+    if (w.get("asks") or 0) >= WHY_MAX_ASKS:
+        return False
+    if w.get("fail"):
+        return now - w.get("at", 0) > 900
+    b, s = int(abs(pct)), ("+" if pct >= 0 else "-")
+    if s != w.get("sign") and b >= 1:
+        return True
+    return b > (w.get("maxb") or 0)
+
+
 def index_reason(label, pct, claimed=False):
     key = why_key(pct)
     old = INDEX_WHY.get(label) or {}
-    if not claimed and old.get("key") == key and (
-            old.get("why") or time.time() - old.get("at", 0) < 3600):
+    if not claimed and not why_due(label, pct):
         return
-    INDEX_WHY[label] = dict(old, key=key, at=time.time())
+    INDEX_WHY[label] = dict(old, key=key, at=time.time(), pending=True)
     c = INDEX_BY.get(label) or (label, "", "", "", False, False)
     group, what = c[2], c[3]
     if label == "\u00a51 = \u20b9":
@@ -16400,22 +18102,31 @@ def index_reason(label, pct, claimed=False):
                 break
     except Exception:
         pass
-    why = ""
+    why, answered = "", not heads      # no headlines: nothing to ask
     if heads:
         with WHY_SEM:
             ans, _e = ask_gemini("Why did %s (%s) %s %.1f%% %s? Headlines:"
                                  "\n- " % (label, what, "rise" if pct >= 0
                                            else "fall", abs(pct),
-                                           "today" if is_trading_day() or
-                                           label not in INDIA_INDICES else
-                                           "in its last session") +
+                                           "today" if why_session(label)[0]
+                                           else "in its last session") +
                                  "\n- ".join(heads), WHY_STYLE)
+        answered = ans is not None
         ans = re.sub(r"\s+", " ", str(ans or "")).strip()
         if ans and "UNKNOWN" not in ans.upper() and len(ans) < 260:
             why = ans
-    # 20.14: said plainly when the news does not explain it
-    INDEX_WHY[label] = {"key": key, "why": why or "No particular reason "
-                        "found in today's news.", "at": time.time()}
+    # 20.14: said plainly when the news does not explain it - 20.17: but
+    # ONLY when Gemini answered; a busy Gemini is not "no reason"
+    today = why_session(label)[1]          # 20.18: the session's own date
+    same = old.get("day") == today
+    INDEX_WHY[label] = {
+        "key": key, "day": today, "at": time.time(),
+        "why": why or ("No particular reason found in today's news."
+                       if answered else (old.get("why") if same else "")),
+        "fail": not answered,
+        "asks": ((old.get("asks") or 0) + 1) if same else 1,
+        "maxb": max(int(abs(pct)), ((old.get("maxb") or 0) if same else 0)),
+        "sign": "+" if pct >= 0 else "-"}
     try:
         _write_json(os.path.join(os.path.dirname(PATHS["state"]),
                                  "index_why.json"), INDEX_WHY)
@@ -16553,18 +18264,21 @@ def fetch_indices(with_guests=None):
             # 20.16: stale figures and holidays get a reason too (NIFTY,
             # SENSEX and VIX had none on the phone after a weekend restart):
             # the move of the last session, asked once a day
-            key = why_key(pct)
+            # 20.17: asked only for the indices on his strip (or with an
+            # alert), and only when why_due says so - see there
             w = INDEX_WHY.get(r["name"]) or {}
-            if w.get("key") == key and w.get("why"):
+            today = why_session(r["name"])[1]
+            # 20.18: a reason is shown ONLY for the session the figure is
+            # from - never an older session's reason under a newer move
+            if w.get("why") and w.get("day") == today:
                 r["why"] = w["why"]
-            elif w.get("why") and (r.get("stale") or (
-                    not is_trading_day() and r["name"] in INDIA_INDICES)) \
-                    and time.time() - w.get("at", 0) < 4 * 86400:
-                r["why"] = w["why"]
-            elif w.get("key") != key or time.time() - w.get("at", 0) > 3600:
+            elif w.get("fail") and w.get("day") == today:
+                r["why"] = ("Reason not found yet - Gemini was busy; it is "
+                            "asked again in a few minutes.")
+            if (r["name"] in pins or r.get("alert")) and \
+                    why_due(r["name"], pct, bool(r.get("stale"))):
                 # marked at once, so the next cycle does not start another
-                INDEX_WHY[r["name"]] = dict(w, key=key, at=time.time(),
-                                            why="")
+                INDEX_WHY[r["name"]] = dict(w, at=time.time(), pending=True)
                 threading.Thread(target=index_reason, daemon=True,
                                  args=(r["name"], r.get("pct") or 0,
                                        True)).start()
@@ -19676,9 +21390,13 @@ def cloud_watch():
     # off (public figures; he agreed the names he follows may be public)
     fno = [str(x.get("sym") or "").upper() for x in (st.get("fnoWatch") or [])
            if isinstance(x, dict) and x.get("sym")][:8]
+    # 20.17: every share of the table and Out of list - their prices go into
+    # the phone's laptop-off copy (snapshot.json), refreshed every half hour
+    every = list(dict.fromkeys(list(st.get("watchlist") or []) +
+                               [s for _n, s in extra_names(st)]))[:300]
     return {"held": [names(s) for s in held][:120],
             "watch": [names(s) for s in working][:60], "names": full,
-            "fno": fno,
+            "fno": fno, "all": every,
             "quiet": [22, 7], "alerts": alerts,
             "city": city, "region": region}
 
@@ -19939,6 +21657,18 @@ def palert_add(data):
          "until": until, "made": time.strftime("%Y-%m-%d %H:%M"),
          "ref": live["ltp"], "note": str(data.get("note") or "")[:80],
          "hits": 0, "hitAt": 0}
+    # 20.19: a trend line from the chart - its level moves with time
+    ln = data.get("line")
+    if isinstance(ln, dict):
+        try:
+            line = {k: float(ln[k]) for k in ("t1", "p1", "t2", "p2")}
+            line["shift"] = float(ln.get("shift") or 0)
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "error": "The line could not be read."}
+        if line["t1"] == line["t2"]:
+            return {"ok": False, "error": "That line has no slope to follow."}
+        a["line"] = line
+        a["price"] = round(palert_level(a), 2)
     with PALERT_LOCK:
         items = palerts_read()
         items.append(a)
@@ -19956,6 +21686,16 @@ def palert_del(aid):
     threading.Thread(target=cloud_sync, kwargs={"force": True},
                      daemon=True).start()
     return {"ok": True}
+
+
+def palert_level(a):
+    """The alert's price now: fixed, or where its trend line stands."""
+    ln = a.get("line")
+    if not isinstance(ln, dict):
+        return float(a["price"])
+    now = time.time() + float(ln.get("shift") or 0)
+    return ln["p1"] + (ln["p2"] - ln["p1"]) * (now - ln["t1"]) / \
+        (ln["t2"] - ln["t1"])
 
 
 def palert_tick(anytime=False):
@@ -19981,7 +21721,7 @@ def palert_tick(anytime=False):
             continue
         if live.get("at") and time.time() - live["at"] > 120:
             continue                       # an old price is not a touch
-        px, lvl = float(live["ltp"]), float(a["price"])
+        px, lvl = float(live["ltp"]), palert_level(a)
         prev = PALERT_LAST.get(a["id"])
         if prev is None:
             prev = float(a.get("ref") or px)
@@ -20122,6 +21862,238 @@ def cloud_status():
     return out
 
 
+# ---------------------------------------------------------------------------
+# DAILY BACKUP TO GITHUB (20.18) - everything he has typed (the table, the
+# Accounts of every year, the Portfolio, alerts, today's buys, profiles,
+# messages) goes once a day, after the market, into his GitHub repository,
+# so even a lost or dead laptop loses nothing. The repository is PUBLIC (it
+# has to be, for the phone's copy and the free running time), so the files
+# are locked with a long random key - xsalsa20-poly1305, the same lock as
+# GitHub's own secrets above - never with his password, which is a short
+# PIN anyone could try out offline. The key is a RECOVERY CODE he keeps off
+# the laptop (Diagnostics -> GitHub backup shows it); on a new computer that
+# code alone opens the backups. Thirty days are kept.
+# ---------------------------------------------------------------------------
+GHB = {"error": "", "running": False}
+GHB_FILES = ("cas_state.json", "accounts.json", "accounts_ui.json",
+             "portfolio.json", "alerts.json", "todays_buys.json",
+             "profiles.json", "users.json", "users.json.k", "users.json.m",
+             "picks_history.json", "ai_calls.json", "Messages/messages.json")
+GHB_KEEP_DAYS = 30
+_B32 = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"        # no 0/O or 1/I to mistake
+
+
+def ghb_key_path():
+    return os.path.join(acc_dir(), "backupkey.json")
+
+
+def ghb_state_path():
+    return os.path.join(acc_dir(), "ghbackup.json")
+
+
+def ghb_code():
+    """His recovery code (made once: 160 random bits, 32 letters/digits)."""
+    d = _read_json(ghb_key_path(), {})
+    c = d.get("code") if isinstance(d, dict) else None
+    if not c:
+        n = int.from_bytes(secrets.token_bytes(20), "big")
+        s = ""
+        for _ in range(32):
+            s = _B32[n % 32] + s
+            n //= 32
+        c = "-".join(s[i:i + 4] for i in range(0, 32, 4))
+        _write_json(ghb_key_path(), {"code": c,
+                                     "made": time.strftime("%d %b %Y")})
+    return c
+
+
+def _ghb_derive(code, salt):
+    clean = re.sub(r"[^A-Z0-9]", "", str(code or "").upper())
+    return hashlib.scrypt(clean.encode(), salt=salt, n=2 ** 14, r=8, p=1,
+                          dklen=32)
+
+
+def _secretbox(key, msg):
+    nonce = secrets.token_bytes(24)
+    sk = _hsalsa20(key, nonce[:16])
+    stream = _salsa20_stream(sk, nonce[16:], 32 + len(msg))
+    c = bytes(a ^ b for a, b in zip(msg, stream[32:]))
+    return nonce + _poly1305(stream[:32], c) + c
+
+
+def _secretbox_open(key, box):
+    if len(box) < 40:
+        return None
+    nonce, tag, c = box[:24], box[24:40], box[40:]
+    sk = _hsalsa20(key, nonce[:16])
+    stream = _salsa20_stream(sk, nonce[16:], 32 + len(c))
+    if not _hmac.compare_digest(_poly1305(stream[:32], c), tag):
+        return None                       # wrong code, or the file damaged
+    return bytes(a ^ b for a, b in zip(c, stream[32:]))
+
+
+def ghb_pack():
+    base = acc_dir()
+    names = list(GHB_FILES) + sorted(
+        f for f in os.listdir(base)
+        if re.fullmatch(r"accounts-\d{4}-\d{2}\.json", f))
+    files = {}
+    for n in names:
+        p = os.path.join(base, n)
+        if os.path.isfile(p) and os.path.getsize(p) < 8000000:
+            with open(p, "rb") as f:
+                files[n] = base64.b64encode(f.read()).decode()
+    body = gzip.compress(json.dumps({
+        "v": 1, "made": time.strftime("%Y-%m-%d %H:%M"), "version": VERSION,
+        "files": files}).encode())
+    salt = secrets.token_bytes(16)
+    return (b"CCB1" + salt + _secretbox(_ghb_derive(ghb_code(), salt), body),
+            sorted(files))
+
+
+def ghb_unpack(blob, code):
+    if blob[:4] != b"CCB1":
+        return None
+    plain = _secretbox_open(_ghb_derive(code, blob[4:20]), blob[20:])
+    if plain is None:
+        return None
+    return json.loads(gzip.decompress(plain).decode("utf-8"))
+
+
+def ghb_dir(d):
+    return "backups/" + ("copy-%s" % d["id"] if d.get("shared") else "main")
+
+
+def ghb_run(force=False):
+    """Once a day after 15:35 (or at the first chance when the last copy is
+    more than 30 hours old); `force` - now. True when a copy was sent."""
+    d = cloud_read()
+    token = cloud_token(d)
+    if not d.get("on") or not token:
+        GHB["error"] = "GitHub is not set up (Diagnostics -> Phone news)"
+        return False
+    st = _read_json(ghb_state_path(), {})
+    st = st if isinstance(st, dict) else {}
+    today = datetime.date.today().isoformat()
+    if not force:
+        due = (st.get("day") != today and time.strftime("%H:%M") >= "15:35") \
+            or time.time() - (st.get("at") or 0) > 30 * 3600
+        if not due or time.time() - (st.get("tried") or 0) < 1800:
+            return False
+    if GHB["running"]:
+        return False
+    GHB["running"] = True
+    try:
+        st["tried"] = time.time()
+        _write_json(ghb_state_path(), st)
+        blob, names = ghb_pack()
+        path = "%s/%s.ccb" % (ghb_dir(d), today)
+        ok, err = _cloud_file(token, d["repo"], path,
+                              base64.b64encode(blob).decode(),
+                              "Capital Compass backup " + today)
+        if not ok:
+            GHB["error"] = err[:120]
+            return False
+        GHB["error"] = ""
+        st.update(day=today, at=time.time(), size=len(blob), files=names,
+                  when=time.strftime("%d %b %Y, %H:%M"))
+        _write_json(ghb_state_path(), st)
+        # thirty days are kept
+        c, lst, _h = gh_api("GET", "/repos/%s/contents/%s" % (
+            d["repo"], ghb_dir(d)), token)
+        if c == 200 and isinstance(lst, list):
+            cut = (datetime.date.today() - datetime.timedelta(
+                days=GHB_KEEP_DAYS)).isoformat()
+            for f in lst:
+                m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.ccb", f.get("name", ""))
+                if m and m.group(1) < cut:
+                    gh_api("DELETE", "/repos/%s/contents/%s" % (
+                        d["repo"], f["path"]), token,
+                        {"message": "old backup", "sha": f["sha"]})
+        return True
+    except Exception as e:
+        GHB["error"] = str(e)[:120]
+        return False
+    finally:
+        GHB["running"] = False
+
+
+def ghb_list():
+    d = cloud_read()
+    token = cloud_token(d)
+    if not d.get("on") or not token:
+        return {"ok": False, "error": "GitHub is not set up"}
+    c, lst, _h = gh_api("GET", "/repos/%s/contents/%s" % (d["repo"],
+                                                         ghb_dir(d)), token)
+    if c == 404:
+        return {"ok": True, "days": []}
+    if c != 200 or not isinstance(lst, list):
+        return {"ok": False, "error": "GitHub: %s" % (lst or {}).get(
+            "message", c)}
+    days = sorted((re.sub(r"\.ccb$", "", f["name"]) for f in lst
+                   if f.get("name", "").endswith(".ccb")), reverse=True)
+    return {"ok": True, "days": days}
+
+
+def ghb_restore(day, code):
+    """Puts the files of one day's GitHub backup back, after setting aside
+    every file it replaces (Backups/before_github_restore_<time>/)."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(day or "")):
+        return {"ok": False, "error": "Pick a day"}
+    d = cloud_read()
+    token = cloud_token(d)
+    if not d.get("on") or not token:
+        return {"ok": False, "error": "GitHub is not set up"}
+    c, f, _h = gh_api("GET", "/repos/%s/contents/%s/%s.ccb" % (
+        d["repo"], ghb_dir(d), day), token, timeout=60)
+    if c != 200:
+        return {"ok": False, "error": "GitHub: %s" % (f or {}).get(
+            "message", c)}
+    try:
+        blob = base64.b64decode(base64.b64decode(f.get("content") or ""))
+        pack = ghb_unpack(blob, code or ghb_code())
+    except Exception:
+        pack = None
+    if not pack:
+        return {"ok": False, "error": "That recovery code does not open this "
+                "backup - check the code (letters and digits; dashes do not "
+                "matter)."}
+    base = acc_dir()
+    aside = os.path.join(base, "Backups", "before_github_restore_" +
+                         time.strftime("%Y-%m-%d_%H%M%S"))
+    with NOTE_LOCK:
+        for name, b64 in (pack.get("files") or {}).items():
+            if ".." in name or name.startswith("/"):
+                continue
+            dest = os.path.join(base, name)
+            if os.path.exists(dest):
+                os.makedirs(os.path.dirname(os.path.join(aside, name)),
+                            exist_ok=True)
+                with open(dest, "rb") as a, open(os.path.join(aside, name),
+                                                 "wb") as b:
+                    b.write(a.read())
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest + ".tmp", "wb") as w:
+                w.write(base64.b64decode(b64))
+            os.replace(dest + ".tmp", dest)
+        PHONE_REV["rev"] += 1000
+    return {"ok": True, "files": sorted(pack.get("files") or {}),
+            "made": pack.get("made"), "aside": os.path.basename(aside)}
+
+
+def ghb_status(reveal=False):
+    st = _read_json(ghb_state_path(), {})
+    st = st if isinstance(st, dict) else {}
+    k = _read_json(ghb_key_path(), {})
+    out = {"last": st.get("when") or "", "files": st.get("files") or [],
+           "size": st.get("size") or 0, "error": GHB["error"],
+           "codeMade": (k or {}).get("made", "") if isinstance(k, dict) else "",
+           "on": bool(cloud_read().get("on"))}
+    if reveal:
+        out["code"] = ghb_code()
+    return out
+
+
 def cloud_off():
     d = cloud_read()
     token = cloud_token(d)
@@ -20219,6 +22191,10 @@ def reco_watcher():
             cloud_sync()                 # the share list to the cloud, hourly
         except Exception as e:
             CLOUD["error"] = str(e)[:120]
+        try:
+            ghb_run()                    # 20.18: the daily GitHub backup
+        except Exception as e:
+            GHB["error"] = str(e)[:120]
         if time.time() - NEWSPUSH["at"] > 600 and NEWS.get("items"):
             try:
                 news_push_check()
@@ -20675,6 +22651,10 @@ class Handler(BaseHTTPRequestHandler):
             with NOTE_LOCK:           # the notes and the stamp belong together
                 st = dict(load_state())
                 st["_phoneRev"] = PHONE_REV["rev"]
+            # 20.19: today's charge rates (a contract note may have
+            # corrected one) for the PROFIT and BREAKEVEN columns
+            today_iso = datetime.date.today().isoformat()
+            st["_chgRates"] = {k: chg_rate(k, today_iso) for k in CHG_RATES}
             self._send(200, st)
             return
 
@@ -20902,6 +22882,19 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if path == "/api/aistatus":
+            # 20.17: which Gemini models are tried, which are set aside, and
+            # whether the backup AI on this Mac is ready
+            now = time.time()
+            self._send(200, {
+                "order": gem_order(), "saved": GEMINI["model"],
+                "setAside404": sorted(m for m, t in GEM_DEAD.items()
+                                      if t > now),
+                "busyNow": sorted(m for m, t in GEM_BUSY.items() if t > now),
+                "lastAnsweredBy": GEM_LAST["src"],
+                "backup": ollama_status()})
+            return
+
         if path == "/api/betaprobe":
             st = load_state()
             syms = (st.get("watchlist") or [])[:2]
@@ -20974,11 +22967,44 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/tv":
             if "q" in qs:
-                self._send(200, tv_search(qs.get("q", [""])[0]))
+                self._send(200, tv_search(qs.get("q", [""])[0],
+                                          qs.get("live", [""])[0] == "1"))
+            elif "chv" in qs:
+                self._send(200, tv_channel(qs.get("chv", [""])[0]))
             elif "ch" in qs:
                 self._send(200, tv_live(qs.get("ch", [""])[0]))
             else:
                 self._send(200, {"ok": True, "channels": TV_CHANNELS})
+            return
+
+        if path == "/api/market":
+            # 20.19: the Market box, one source at a time
+            fn = MKT_KINDS.get(qs.get("what", [""])[0])
+            self._send(200, fn() if fn else {"ok": False,
+                                              "error": "which part?"})
+            return
+
+        if path == "/api/oldcheck":
+            self._send(200, old_check())
+            return
+
+        if path == "/api/corpadj":
+            try:
+                self._send(200, {"ok": True, "rows": corp_adjust_pending()})
+            except Exception as e:
+                self._send(200, {"ok": False, "error": str(e)[:100]})
+            return
+
+        if path == "/api/scorecard":
+            if qs.get("now"):
+                reco_track_update()
+            self._send(200, reco_scorecard())
+            return
+
+        if path == "/api/whatsnew":
+            self._send(200, {"ok": True, "version": VERSION,
+                             "items": WHATS_NEW.get(VERSION, []),
+                             "all": WHATS_NEW})
             return
 
         if path == "/api/company":
@@ -21385,6 +23411,62 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/backups":
             self._send(200, {"backups": list_backups()})
+            return
+
+        if path == "/api/ghbackup":
+            # 20.18: the daily GitHub backup - status, the recovery code,
+            # back up now, the days kept, and putting a day back. Anything
+            # beyond the status only from the page itself (X-CAS)
+            act = qs.get("do", [""])[0]
+            if act and self.headers.get("X-CAS") != "1":
+                self._send(403, {"error": "only from the dashboard"})
+            elif act == "code":
+                self._send(200, ghb_status(reveal=True))
+            elif act == "now":
+                okb = ghb_run(force=True)
+                self._send(200, dict(ghb_status(), ok=okb))
+            elif act == "list":
+                self._send(200, ghb_list())
+            elif act == "restore":
+                self._send(200, ghb_restore(qs.get("day", [""])[0],
+                                            qs.get("code", [""])[0]))
+            else:
+                self._send(200, ghb_status())
+            return
+
+        if path == "/api/aiping":
+            # 20.18: the daily test asks one real question (one a day)
+            if self.headers.get("X-CAS") != "1":
+                self._send(403, {"error": "only from the dashboard"})
+                return
+            t0 = time.time()
+            txt, why = ask_gemini("Reply with the single word OK.", "")
+            self._send(200, {"ok": bool(txt), "by": GEM_LAST["src"] if txt
+                             else "", "error": why,
+                             "sec": round(time.time() - t0, 1)})
+            return
+
+        if path == "/api/snapcheck":
+            # 20.18: how old the phone's laptop-off copy on GitHub is
+            u = cloud_snapshot_url()
+            if not u:
+                self._send(200, {"ok": True, "off": True})
+                return
+            try:
+                raw = urllib.request.urlopen(urllib.request.Request(
+                    u + "?t=%d" % int(time.time() // 60),
+                    headers={"User-Agent": UA}), timeout=15).read()
+                j = json.loads(raw.decode("utf-8", "replace"))
+                age = (time.time() - (j.get("ts") or 0)) / 60
+                self._send(200, {"ok": True, "ageMin": round(age),
+                                 "prices": len(j.get("px") or {}),
+                                 "indices": len(j.get("idx") or [])})
+            except Exception as e:
+                self._send(200, {"ok": False, "error": str(e)[:80]})
+            return
+
+        if path == "/api/backuppreview":
+            self._send(200, backup_preview(qs.get("file", [""])[0]))
             return
 
         if path == "/api/restore":
@@ -21836,6 +23918,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, accounts_action(payload))
             return
+        if urllib.parse.urlparse(self.path).path == "/api/corpadj":
+            try:
+                n = max(0, int(self.headers.get("Content-Length", 0) or 0))
+                payload = json.loads(self.rfile.read(min(n, 4000))
+                                     .decode("utf-8"))
+                self._send(200, corp_adjust_answer(
+                    str(payload.get("id") or ""),
+                    str(payload.get("answer") or "")))
+            except Exception as e:
+                self._send(200, {"ok": False, "error": str(e)[:200]})
+            return
         if urllib.parse.urlparse(self.path).path == "/api/timemachine":
             try:
                 n = max(0, int(self.headers.get("Content-Length", 0) or 0))
@@ -21988,23 +24081,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         NOTE_LOCK.acquire()
         try:
-            self._save_state(payload)
+            saved = self._save_state(payload)
         finally:
             NOTE_LOCK.release()
-        self._send(200, {"ok": True, "phoneRev": PHONE_REV["rev"]})
+        self._send(200, {"ok": bool(saved), "phoneRev": PHONE_REV["rev"]})
 
     def _save_state(self, payload):
         renamed_payload(payload)
         state = load_state()
-        # 20.14: a page that sends an empty table over a full one (before it
-        # had read the table) never wipes it; clearing it is done row by row
-        if isinstance(payload.get("watchlist"), list) and \
-                not payload["watchlist"] and \
-                len(state.get("watchlist") or []) >= 3 and \
-                not payload.get("clearList"):
-            payload.pop("watchlist", None)
-            if not payload.get("notes"):
-                payload.pop("notes", None)
+        # 20.17: a page that has not read the table yet sends either an empty
+        # table or none at all, with empty notes, settings and box positions.
+        # 20.16 wrote exactly that over his data. Such a save is refused
+        # WHOLE - not just its table - and a dated copy is kept regardless.
+        typed = any(isinstance(d, dict) and
+                    any(str(v or "").strip() for v in d.values())
+                    for d in (state.get("notes") or {}).values())
+        blank_page = ("notes" in payload or "panels" in payload) and (
+            not isinstance(payload.get("watchlist"), list) or
+            (not payload["watchlist"] and
+             len(state.get("watchlist") or []) >= 3))
+        if blank_page and not payload.get("clearList"):
+            print("[state] save refused: the page had not read the table", flush=True)
+            return False
+        if isinstance(payload.get("notes"), dict) and not payload["notes"] \
+                and typed:
+            print("[state] empty notes over typed ones - notes kept", flush=True)
+            payload.pop("notes", None)
         # Notes typed on the iPhone since this page last picked them up are
         # kept: the page sends its whole table, which would otherwise put
         # the old values straight back over them
@@ -22035,6 +24137,7 @@ class Handler(BaseHTTPRequestHandler):
             if k in payload:
                 state[k] = payload[k]
         save_state(state)
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -25490,12 +27593,13 @@ def cert_make():
 
 def intraday_charges(buy_val, sell_val):
     """The same Zerodha figures as the page's PROFIT column."""
+    d = datetime.date.today().isoformat()
     brk = min(buy_val * 0.0003, 20) + min(sell_val * 0.0003, 20)
-    stt = sell_val * 0.00025
-    exch = (buy_val + sell_val) * 0.0000307
-    sebi = (buy_val + sell_val) * 0.000001
-    stamp = buy_val * 0.00003
-    gst = (brk + exch + sebi) * 0.18
+    stt = sell_val * chg_rate("stt_intra", d)
+    exch = (buy_val + sell_val) * chg_rate("exch_nse", d)
+    sebi = (buy_val + sell_val) * chg_rate("sebi", d)
+    stamp = buy_val * chg_rate("stamp_intra", d)
+    gst = (brk + exch + sebi) * chg_rate("gst", d)
     return brk + stt + exch + sebi + stamp + gst
 
 
@@ -25504,9 +27608,18 @@ def phone_data():
     notes = st.get("notes") or {}
     labels = st.get("headings") or {}
 
+    live = in_market_hours()
+
     def quote(sym):
         with CACHE_LOCK:
             q = dict(CACHE.get(sym) or {})
+        # 20.19: in market hours a price not read for five minutes is not
+        # sent as if current - the phone shows "could not fetch"
+        if live and q and time.time() - (q.get("at") or 0) > 300:
+            for k in ("ltp", "ltpNum", "pchange", "icp", "iep", "ieq"):
+                q[k] = None
+            q["_nf"] = True
+            return q
         if q.get("pchange") in (None, ""):
             ltp, prev = to_number(q.get("ltpNum") or q.get("ltp")), \
                 to_number(q.get("prevclose"))
@@ -25534,7 +27647,7 @@ def phone_data():
             prof = round((sv - bv - intraday_charges(bv, sv)) / bv * 100, 2)
         active.append({"symbol": sym, "qty": n.get("buy") or "",
                        "price": price, "target": tgt,
-                       "ltp": to_number(q.get("ltpNum") or q.get("ltp")),
+                       "ltp": to_number(q.get("ltpNum") or q.get("ltp")), "nf": bool(q.get("_nf")),
                        "pchange": to_number(q.get("pchange")),
                        "icp": to_number(q.get("icp")),
                        "iep": to_number(q.get("iep")),
@@ -25551,7 +27664,7 @@ def phone_data():
             continue
         q = quote(sym)
         held.append({"symbol": sym, "old": o, "yesterday": y,
-                     "ltp": to_number(q.get("ltpNum") or q.get("ltp")),
+                     "ltp": to_number(q.get("ltpNum") or q.get("ltp")), "nf": bool(q.get("_nf")),
                      "pchange": to_number(q.get("pchange"))})
     # every other list, so all of them can be looked at on the phone: rows
     # with nothing typed in them, and the Out of list shares
@@ -25562,13 +27675,13 @@ def phone_data():
             continue
         q = quote(sym)
         blank.append({"symbol": sym,
-                      "ltp": to_number(q.get("ltpNum") or q.get("ltp")),
+                      "ltp": to_number(q.get("ltpNum") or q.get("ltp")), "nf": bool(q.get("_nf")),
                       "pchange": to_number(q.get("pchange"))})
     outl = []
     for name, sym in extra_names(st):
         q = quote(sym)
         outl.append({"name": name, "symbol": sym,
-                     "ltp": to_number(q.get("ltpNum") or q.get("ltp")),
+                     "ltp": to_number(q.get("ltpNum") or q.get("ltp")), "nf": bool(q.get("_nf")),
                      "pchange": to_number(q.get("pchange"))})
     # the same markets as the dashboard's strip, with its colours (a rise in
     # oil or the dollar shows red); CNBC's symbol goes with each, so the
@@ -26312,7 +28425,8 @@ def main():
                connection_watcher, beta_refresh_loop, tickertape_warm_loop,
                eod_watcher, admin_poller, bans_poller, preview_watcher, rules_watcher,
                palert_loop, gemini_relay_loop, lt_warm_loop, msg_loop,
-               acc_backup_loop, asset_loop, funda_loop, advtax_loop):
+               acc_backup_loop, asset_loop, funda_loop, advtax_loop,
+               reco_track_loop):
         threading.Thread(target=fn, daemon=True).start()
     try:
         srv.serve_forever()
@@ -26323,6 +28437,612 @@ def main():
         except Exception:
             pass
         print("\n  Stopped.")
+
+
+# =========================================================================
+# 20.19: THE MARKET BOX - what other apps show that the dashboard did not:
+# FII / DII cash flows, bulk and block deals and insider filings in HIS
+# shares, delivery % from NSE's daily file, a sector heatmap down to the
+# shares, and the big individual investors' portfolios (Trendlyne). Each
+# answer carries the time or date it is from; a source that cannot be read
+# now answers "could not fetch the latest" - nothing older is passed off
+# as current (the FII / DII history keeps its own dates).
+# =========================================================================
+MKT_CACHE = {}
+MKT_LOCK = threading.Lock()
+FIIDII_FILE = os.path.join(DATA_DIR, "fiidii.json")
+SECTOR_INDICES = ["NIFTY BANK", "NIFTY IT", "NIFTY AUTO", "NIFTY FMCG",
+                  "NIFTY PHARMA", "NIFTY METAL", "NIFTY ENERGY",
+                  "NIFTY REALTY", "NIFTY MEDIA", "NIFTY PSU BANK",
+                  "NIFTY FINANCIAL SERVICES", "NIFTY OIL & GAS",
+                  "NIFTY HEALTHCARE INDEX", "NIFTY CONSUMER DURABLES",
+                  "NIFTY PRIVATE BANK", "NIFTY CHEMICALS"]
+
+
+def my_symbols(state=None):
+    """Every share that is his: the watchlist, OLD / YESTERDAY, Out of
+    list, and whatever the Accounts hold."""
+    st = state or load_state()
+    out = {str(s).upper() for s in (st.get("watchlist") or [])}
+    out |= {str(s).upper() for s in corp_symbols(st)}
+    try:
+        acc = acc_load()
+        if acc:
+            for r in acc_compute(acc, acc_broker()).get("holdings") or []:
+                if (r.get("qty") or 0) > 0:
+                    out.add(str(r.get("sym") or "").upper())
+    except Exception:
+        pass
+    out.discard("")
+    return out
+
+
+def _mkt_cached(key, ttl, make):
+    """make() -> dict with ok. A failed read is never covered by an older
+    good one: the error goes out as it is."""
+    with MKT_LOCK:
+        hit = MKT_CACHE.get(key)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+    try:
+        out = make()
+    except Exception as e:
+        out = {"ok": False, "error": "could not fetch the latest (%s)"
+               % str(e)[:80]}
+    out["readAt"] = time.strftime("%d %b %Y %H:%M")
+    if out.get("ok"):
+        with MKT_LOCK:
+            MKT_CACHE[key] = (time.time(), out)
+    return out
+
+
+def mkt_fiidii():
+    def make():
+        hist = _read_json(FIIDII_FILE, {})
+        data, err = SESSION.fetch("https://www.nseindia.com/api/"
+                                  "fiidiiTradeReact", "https://www.nseindia"
+                                  ".com/reports/fii-dii", timeout=15)
+        latest = None
+        if isinstance(data, list) and data:
+            day = {}
+            for r in data:
+                cat = str(r.get("category") or "").upper()
+                k = "fii" if "FII" in cat or "FPI" in cat else \
+                    "dii" if "DII" in cat else ""
+                if not k:
+                    continue
+                day[k] = {"buy": to_number(r.get("buyValue")),
+                          "sell": to_number(r.get("sellValue")),
+                          "net": to_number(r.get("netValue"))}
+                try:
+                    day["date"] = datetime.datetime.strptime(
+                        str(r.get("date"))[:11], "%d-%b-%Y").date() \
+                        .isoformat()
+                except ValueError:
+                    pass
+            if day.get("date") and "fii" in day and "dii" in day:
+                latest = day
+                hist[day["date"]] = {"fii": day["fii"], "dii": day["dii"]}
+                keep = sorted(hist)[-120:]
+                _write_json(FIIDII_FILE, {k: hist[k] for k in keep})
+        days = [dict(hist[k], date=k) for k in sorted(hist, reverse=True)
+                [:30]]
+        if not latest:
+            return {"ok": False, "error": "could not fetch the latest "
+                    "(%s)" % (err or "NSE gave nothing"), "history": days}
+        return {"ok": True, "latest": latest, "history": days,
+                "source": "NSE, provisional cash-market figures (₹ crore)"}
+    return _mkt_cached("fiidii", 20 * 60, make)
+
+
+def mkt_deals():
+    def make():
+        mine = my_symbols()
+        t1 = datetime.date.today()
+        t0 = t1 - datetime.timedelta(days=10)
+        rows, errs = [], []
+        for kind in ("bulk", "block"):
+            url = ("https://www.nseindia.com/api/historicalOR/bulk-block-"
+                   "short-deals?optionType=%s_deals&from=%s&to=%s" % (
+                       kind, t0.strftime("%d-%m-%Y"), t1.strftime("%d-%m-%Y")))
+            data, err = SESSION.fetch(url, "https://www.nseindia.com/report-"
+                                      "detail/display-bulk-and-block-deals",
+                                      timeout=20)
+            got = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(got, list):
+                errs.append("%s deals: %s" % (kind, err or "nothing"))
+                continue
+            for r in got:
+                sym = str(r.get("BD_SYMBOL") or "").upper()
+                try:
+                    d = datetime.datetime.strptime(
+                        str(r.get("BD_DT_DATE"))[:11], "%d-%b-%Y").date()
+                except ValueError:
+                    continue
+                rows.append({"kind": kind, "date": d.isoformat(),
+                             "sym": sym, "name": str(r.get("BD_SCRIP_NAME")
+                                                     or "")[:50],
+                             "who": str(r.get("BD_CLIENT_NAME") or "")[:70],
+                             "side": str(r.get("BD_BUY_SELL") or "")[:4],
+                             "qty": to_number(r.get("BD_QTY_TRD")),
+                             "price": to_number(r.get("BD_TP_WATP")),
+                             "mine": sym in mine})
+        if errs and not rows:
+            return {"ok": False, "error": "could not fetch the latest (%s)"
+                    % "; ".join(errs)}
+        rows.sort(key=lambda r: (r["date"], r["sym"]), reverse=True)
+        return {"ok": True, "rows": rows, "from": t0.isoformat(),
+                "to": t1.isoformat(), "warn": errs,
+                "mineCount": sum(1 for r in rows if r["mine"])}
+    return _mkt_cached("deals", 30 * 60, make)
+
+
+def mkt_insider():
+    def make():
+        mine = my_symbols()
+        data, err = SESSION.fetch("https://www.nseindia.com/api/corporates-"
+                                  "pit-gg?index=equities", "https://www.nse"
+                                  "india.com/companies-listing/corporate-"
+                                  "filings-insider-trading", timeout=40)
+        got = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(got, list):
+            return {"ok": False, "error": "could not fetch the latest (%s)"
+                    % (err or "NSE gave nothing")}
+        cut = datetime.date.today() - datetime.timedelta(days=14)
+        filed = {}
+        for r in got:
+            sym = str(r.get("symbol") or "").upper()
+            if sym not in mine:
+                continue
+            try:
+                d = datetime.datetime.strptime(str(r.get(
+                    "broadcastDateTime"))[:11], "%d-%b-%Y").date()
+            except ValueError:
+                continue
+            if d >= cut:
+                filed.setdefault(sym, []).append(d.isoformat())
+        out = []
+        t1 = datetime.date.today()
+        for sym in sorted(filed)[:25]:
+            ref = "https://www.nseindia.com/get-quotes/equity?symbol=" + Q(sym)
+            rows, err2 = _nse_rows(
+                "https://www.nseindia.com/api/corporates-pit?index=equities&"
+                "symbol=%s&from_date=%s&to_date=%s" % (
+                    Q(sym), (t1 - datetime.timedelta(days=30)).strftime(
+                        "%d-%m-%Y"), t1.strftime("%d-%m-%Y")), ref)
+            det = []
+            for r in (rows or [])[:8]:
+                det.append({"who": str(pick(r, ["acqName"]) or "")[:60],
+                            "role": str(pick(r, ["personCategory"]) or "")
+                            [:40],
+                            "type": str(pick(r, ["tdpTransactionType",
+                                                 "acqMode"]) or "")[:20],
+                            "qty": to_number(pick(r, ["secAcq"])),
+                            "value": to_number(pick(r, ["secVal"])),
+                            "date": str(pick(r, ["acqfromDt", "date",
+                                                 "intimDt"]) or "")[:11]})
+            out.append({"sym": sym, "filed": sorted(set(filed[sym]),
+                                                    reverse=True),
+                        "rows": det, "err": err2 if rows is None else ""})
+        return {"ok": True, "rows": out, "since": cut.isoformat(),
+                "watching": len(mine)}
+    return _mkt_cached("insider", 2 * 3600, make)
+
+
+def mkt_delivery():
+    def make():
+        mine = my_symbols()
+        today = datetime.date.today()
+        days = []
+        if is_trading_day(today) and datetime.datetime.now().hour >= 18:
+            days.append(today)          # tonight's file, once published
+        days.append(prior_trading_day(today))
+        last_err = ""
+        for day in days:
+            url = ("https://nsearchives.nseindia.com/products/content/"
+                   "sec_bhavdata_full_%s.csv" % day.strftime("%d%m%Y"))
+            try:
+                raw = urllib.request.urlopen(urllib.request.Request(
+                    url, headers={"User-Agent": "Mozilla/5.0"}),
+                    timeout=25).read()
+            except Exception as e:
+                last_err = str(e)[:60]
+                continue
+            lines = raw.decode("utf-8", "replace").splitlines()
+            if len(lines) < 10:
+                continue
+            head = [h.strip() for h in lines[0].split(",")]
+            rows = []
+            for ln in lines[1:]:
+                m = dict(zip(head, [x.strip() for x in ln.split(",")]))
+                if m.get("SERIES") not in ("EQ", "BE", "BZ"):
+                    continue
+                sym = m.get("SYMBOL", "").upper()
+                if sym not in mine:
+                    continue
+                rows.append({"sym": sym, "close": to_number(m.get(
+                    "CLOSE_PRICE")), "traded": to_number(m.get(
+                        "TTL_TRD_QNTY")), "deliv": to_number(m.get(
+                            "DELIV_QTY")), "pct": to_number(m.get(
+                                "DELIV_PER")), "chg": None})
+                try:
+                    pc = float(m.get("PREV_CLOSE"))
+                    rows[-1]["chg"] = round((float(m["CLOSE_PRICE"]) / pc
+                                             - 1) * 100, 2)
+                except (KeyError, ValueError, ZeroDivisionError):
+                    pass
+            rows.sort(key=lambda r: -(r["pct"] or 0))
+            return {"ok": True, "day": day.isoformat(), "rows": rows,
+                    "source": "NSE's daily price and delivery file"}
+        return {"ok": False, "error": "could not fetch the latest (%s)"
+                % (last_err or "the file is not published yet")}
+    return _mkt_cached("delivery", 3600, make)
+
+
+def mkt_heatmap():
+    def make():
+        mine = my_symbols()
+        out, errs, newest = [], [], ""
+        for name in SECTOR_INDICES:
+            data, err = IDX_SESSION.fetch(MW + Q(name), "https://www.nseindia"
+                                          ".com/market-data/live-market-"
+                                          "indices", timeout=12)
+            arr = ((data or {}).get("data") or {}).get("data") \
+                if isinstance(data, dict) else None
+            if not isinstance(arr, list) or not arr:
+                errs.append(name)
+                continue
+            idx = next((r for r in arr if r.get("priority") == 1), None)
+            shares = []
+            for r in arr:
+                if r.get("priority") == 1 or not r.get("symbol"):
+                    continue
+                sym = str(r["symbol"]).upper()
+                shares.append({"sym": sym, "pct": to_number(r.get("pChange")),
+                               "ltp": to_number(r.get("lastPrice")),
+                               "mine": sym in mine})
+            shares.sort(key=lambda r: -(r["pct"] if r["pct"] is not None
+                                        else -999))
+            at = str((idx or {}).get("lastUpdateTime") or "")
+            newest = max(newest, at)
+            out.append({"name": name, "pct": to_number((idx or {}).get(
+                "pChange")), "at": at, "shares": shares})
+        if not out:
+            return {"ok": False, "error": "could not fetch the latest "
+                    "(NSE did not answer for any sector)"}
+        out.sort(key=lambda r: -(r["pct"] if r["pct"] is not None else -999))
+        return {"ok": True, "sectors": out, "at": newest, "missing": errs}
+    return _mkt_cached("heat", 60 if in_market_hours() else 15 * 60, make)
+
+
+def _tl_cells(tr):
+    cells = {}
+    for cls, body in re.findall(r'<td[^>]*class="([^"]*)"[^>]*>(.*?)</td>',
+                                tr, re.S):
+        cells[cls.split()[0] if cls.split() else ""] = body
+    return cells
+
+
+def mkt_stars():
+    def make():
+        mine = my_symbols()
+        raw = _tt_get("https://trendlyne.com/portfolio/superstar-"
+                      "shareholders/index/", timeout=25)
+        out = []
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", raw, re.S):
+            c = _tl_cells(tr)
+            if "sup-name" not in c:
+                continue
+
+            def links(body):
+                res = []
+                for href, txt in re.findall(
+                        r'href="https://trendlyne\.com/equity/\d+/([^/"]+)/'
+                        r'"[^>]*>(.*?)</a>', body or "", re.S):
+                    t = _txt(txt)
+                    m = re.search(r"(-?[\d.]+)\s*%\s*$", t)
+                    res.append({"sym": href.upper(), "text": t[:60],
+                                "chg": float(m.group(1)) if m else None,
+                                "mine": href.upper() in mine})
+                return res
+            # the change sits beside the link text in bought / sold
+            def moves(body):
+                res = []
+                for a in re.split(r"(?=<a )", body or ""):
+                    m = re.search(r'href="https://trendlyne\.com/equity/\d+/'
+                                  r'([^/"]+)/"', a)
+                    if not m:
+                        continue
+                    t = _txt(a)
+                    pm = re.search(r"(-?[\d.]+)\s*%", t)
+                    res.append({"sym": m.group(1).upper(),
+                                "text": re.sub(r"\s*-?[\d.]+\s*%.*", "", t)
+                                [:50],
+                                "chg": float(pm.group(1)) if pm else None,
+                                "mine": m.group(1).upper() in mine})
+                return res
+            val = _txt(c.get("sup-value"))
+            vm = re.match(r"([\d,.]+)\s*Cr\s*(-?[\d.]+)?\s*%?", val)
+            href = re.search(r'href="([^"]+)"', c["sup-name"])
+            out.append({"name": _txt(c["sup-name"])[:60],
+                        "url": href.group(1) if href else "",
+                        "value": vm.group(1) if vm else val[:30],
+                        "chg": float(vm.group(2)) if vm and vm.group(2)
+                        else None,
+                        "n": to_number(_txt(c.get("sup-qty"))),
+                        "top": links(c.get("top-holding-data")),
+                        "bought": moves(c.get("bought-data")),
+                        "sold": moves(c.get("sold-data"))})
+        if not out:
+            return {"ok": False, "error": "could not fetch the latest "
+                    "(Trendlyne's page gave no table)"}
+        return {"ok": True, "rows": out,
+                "source": "Trendlyne, from the shareholding filed with the "
+                          "exchanges (each quarter)"}
+    return _mkt_cached("stars", 12 * 3600, make)
+
+
+MKT_KINDS = {"fiidii": mkt_fiidii, "deals": mkt_deals,
+             "insider": mkt_insider, "delivery": mkt_delivery,
+             "heat": mkt_heatmap, "stars": mkt_stars}
+
+
+# =========================================================================
+# 20.19: OLD AGAINST THE ACCOUNTS, BONUS / SPLIT PROMPTS, THE BROKER-CALL
+# SCORECARD AND "WHAT'S NEW"
+# =========================================================================
+def _squash(s):
+    return re.sub(r"[^A-Z0-9&]", "", str(s or "").upper())
+
+
+def old_check():
+    """The OLD column (shares held) beside Accounts -> Holdings. Shares held
+    in the Accounts that are in Out of list are matched by name there (Out
+    of list has no quantity), and the match is shown."""
+    st = load_state()
+    acc = acc_load()
+    if not acc:
+        return {"ok": False, "error": "No Accounts yet."}
+    v = acc_compute(acc, acc_broker())
+    held = {}
+    for r in v.get("holdings") or []:
+        if (r.get("qty") or 0) > 0:
+            s = str(r.get("sym") or "").upper()
+            held[s] = held.get(s, 0) + r["qty"]
+    last = max((str(t.get("date") or "") for t in acc.get("tx") or []),
+               default="")
+    notes = st.get("notes") or {}
+    wl = [str(s).upper() for s in st.get("watchlist") or []]
+    out_names = [x.strip() for x in str(st.get("outOfList") or "")
+                 .splitlines() if x.strip()]
+    rows = []
+    for s in wl:
+        raw = str((notes.get(s) or {}).get("old") or "").strip()
+        if not raw and s not in held:
+            continue
+        try:
+            o = float(raw.replace(",", "")) if raw else 0.0
+        except ValueError:
+            rows.append({"sym": s, "old": raw, "acc": held.get(s, 0),
+                         "why": "OLD is not a number"})
+            continue
+        a = held.get(s, 0)
+        if abs(o - a) > 1e-9:
+            rows.append({"sym": s, "old": raw or "(blank)", "acc": a,
+                         "why": "sold since OLD was typed?" if o > a else
+                         "bought since OLD was typed?" if a > o else ""})
+    inlist = set(wl)
+    for s, a in sorted(held.items()):
+        if s in inlist:
+            continue
+        hit = next((n for n in out_names if len(_squash(n)) >= 3 and
+                    (s.startswith(_squash(n)) or _squash(n) == s)), None)
+        if not hit:
+            rows.append({"sym": s, "old": "(not in the table or Out of "
+                         "list)", "acc": a, "why": "held in the Accounts "
+                         "only"})
+    return {"ok": True, "rows": rows, "accTo": last,
+            "checked": len(set(wl) | set(held)),
+            "oldLabel": corp_labels(st)[0]}
+
+
+CORPADJ_FILE = os.path.join(DATA_DIR, "corp_adjust.json")
+
+
+def _ratio(text):
+    m = re.search(r"(\d+)\s*[:∶]\s*(\d+)", text or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def corp_adjust_pending():
+    """Bonus issues and splits in a share he holds, from the ex-date on,
+    each asked once. The rows are remembered when first seen (the
+    corporate-action list drops a row once it has gone ex)."""
+    seen = _read_json(CORPADJ_FILE, {})
+    try:
+        rows = list(CORP_CACHE.get("rows") or [])
+    except Exception:
+        rows = []
+    st = load_state()
+    notes = st.get("notes") or {}
+    acc = acc_load()
+    held = {}
+    if acc:
+        for r in acc_compute(acc, acc_broker()).get("holdings") or []:
+            if (r.get("qty") or 0) > 0:
+                s = str(r.get("sym") or "").upper()
+                held[s] = held.get(s, 0) + r["qty"]
+    changed = False
+    for r in rows:
+        if r.get("kind") not in ("Bonus", "Split") or not r.get("exIso"):
+            continue
+        rid = r["id"]
+        if rid not in seen:
+            seen[rid] = {"sym": r["symbol"], "kind": r["kind"],
+                         "ex": r["exIso"], "text": r.get("purpose") or "",
+                         "value": r.get("value") or "", "answer": ""}
+            changed = True
+    if changed:
+        _write_json(CORPADJ_FILE, seen)
+    today = datetime.date.today().isoformat()
+    out = []
+    for rid, x in seen.items():
+        if x.get("answer") or x["ex"] > today or \
+                x["ex"] < (datetime.date.today() - datetime.timedelta(
+                    days=45)).isoformat():
+            continue
+        sym = x["sym"]
+        raw = str((notes.get(sym) or {}).get("old") or "").strip()
+        try:
+            old = float(raw) if raw else None
+        except ValueError:
+            old = None
+        q = held.get(sym) or old
+        if not q:
+            continue                       # not held
+        new = None
+        if x["kind"] == "Bonus":
+            rt = _ratio(x["value"] or x["text"])
+            if rt and rt[1]:
+                new = q + math.floor(q * rt[0] / rt[1])
+        else:
+            m = re.search(r"from\s*(?:rs\.?|₹)?\s*([\d.]+)\D{1,25}?"
+                          r"([\d.]+)", (x["value"] or "") + " " + x["text"],
+                          re.I)
+            try:
+                f = float(m.group(1)) / float(m.group(2)) if m else None
+            except (ValueError, ZeroDivisionError):
+                f = None
+            if f and abs(f - round(f)) < 1e-9 and f > 1:
+                new = q * round(f)
+        out.append(dict(x, id=rid, held=q, accHeld=held.get(sym),
+                        old=raw, new=new, inTable=sym in (st.get(
+                            "watchlist") or [])))
+    return out
+
+
+def corp_adjust_answer(rid, answer):
+    seen = _read_json(CORPADJ_FILE, {})
+    if rid not in seen:
+        return {"ok": False, "error": "Not found."}
+    seen[rid]["answer"] = str(answer)[:20]
+    seen[rid]["at"] = time.strftime("%d %b %Y %H:%M")
+    _write_json(CORPADJ_FILE, seen)
+    return {"ok": True}
+
+
+# ---- the broker-call scorecard: every call is followed from the day the
+# dashboard first saw it, at the price of that moment ----
+RECOTRACK_FILE = os.path.join(DATA_DIR, "reco_track.json")
+RECOTRACK_LOCK = threading.Lock()
+
+
+def _call_dir(call):
+    c = str(call or "").upper()
+    if any(w in c for w in ("SELL", "REDUCE", "UNDERPERFORM", "UNDERWEIGHT")):
+        return -1
+    if any(w in c for w in ("BUY", "ACCUMULATE", "ADD", "OUTPERFORM",
+                            "OVERWEIGHT")):
+        return 1
+    return 0
+
+
+def reco_track_update():
+    now = time.time()
+    with RECOTRACK_LOCK:
+        tr = _read_json(RECOTRACK_FILE, {})
+        m = dict(RECO.get("map") or {})
+        for sym, r in m.items():
+            tgt = to_number(r.get("target"))
+            d = _call_dir(r.get("call"))
+            if not tgt or not d:
+                continue
+            key = "|".join([sym, str(r.get("house") or ""), str(r.get("on")
+                                                                 or ""),
+                            str(r.get("call") or ""), str(r.get("target"))])
+            with CACHE_LOCK:
+                q = dict(CACHE.get(sym) or {})
+            ltp = to_number(q.get("ltpNum") or q.get("ltp"))
+            fresh = ltp and q.get("at") and now - q["at"] < 900
+            x = tr.get(key)
+            if x is None:
+                if not fresh:
+                    continue               # only a price of this moment
+                tr[key] = {"sym": sym, "house": r.get("house") or "",
+                           "call": r.get("call") or "", "target": tgt,
+                           "on": r.get("on") or "", "dir": d,
+                           "p0": ltp, "d0": datetime.date.today().isoformat(),
+                           "hi": ltp, "lo": ltp, "last": ltp,
+                           "lastAt": now, "hit": ""}
+                continue
+            if fresh:
+                x["hi"], x["lo"] = max(x["hi"], ltp), min(x["lo"], ltp)
+                x["last"], x["lastAt"] = ltp, now
+                if not x["hit"] and ((d > 0 and x["hi"] >= tgt) or
+                                     (d < 0 and x["lo"] <= tgt)):
+                    x["hit"] = datetime.date.today().isoformat()
+        _write_json(RECOTRACK_FILE, tr)
+    return tr
+
+
+def reco_scorecard():
+    tr = _read_json(RECOTRACK_FILE, {})
+    by = {}
+    for x in tr.values():
+        h = x.get("house") or "(not named)"
+        b = by.setdefault(h, {"house": h, "calls": 0, "hit": 0, "moves": [],
+                              "open": 0})
+        b["calls"] += 1
+        if x.get("hit"):
+            b["hit"] += 1
+        else:
+            b["open"] += 1
+        if x.get("p0") and x.get("last"):
+            b["moves"].append((x["last"] / x["p0"] - 1) * 100 * x["dir"])
+    rows = []
+    for b in by.values():
+        mv = b.pop("moves")
+        b["avgMove"] = round(sum(mv) / len(mv), 2) if mv else None
+        b["hitPct"] = round(b["hit"] * 100 / b["calls"], 1) if b["calls"] \
+            else None
+        rows.append(b)
+    rows.sort(key=lambda b: (-(b["hitPct"] or 0), -b["calls"]))
+    calls = sorted(tr.values(), key=lambda x: x.get("d0") or "",
+                   reverse=True)[:200]
+    first = min((x.get("d0") or "" for x in tr.values()), default="")
+    return {"ok": True, "houses": rows, "calls": calls, "since": first}
+
+
+def reco_track_loop():
+    time.sleep(240)
+    while True:
+        try:
+            if in_market_hours() or not RECOTRACK_SEEN["once"]:
+                reco_track_update()
+                RECOTRACK_SEEN["once"] = True
+        except Exception:
+            pass
+        time.sleep(600)
+
+
+RECOTRACK_SEEN = {"once": False}
+
+# what each version added, shown once after an update and in Diagnostics
+WHATS_NEW = {
+    "20.19": [
+        "Accounts → Trades → Read a contract note: the PDF (or a photo or screenshot) fills the trades, and every charge is checked against your Accounts to the paisa; a difference is shown in red and nothing changes without your yes",
+        "Market box (📊 button): FII / DII flows, bulk and block deals and insider filings in your shares, delivery %, a sector heatmap down to the shares, and the big investors' portfolios",
+        "The OLD column is checked against Accounts → Holdings after the close; differences are listed",
+        "A bonus or split in a share you hold asks once to adjust OLD and add the row to the Accounts",
+        "Company box: peers side by side, and the change in shareholding over the last quarter",
+        "Broker calls: a scorecard of how each research house's calls have done since the dashboard first saw them",
+        "Alerts on chart lines: right-click a drawn line to be told when the price crosses it",
+        "Taxes: tax-loss harvesting, shown only when it can save tax",
+        "Phone chart: any share, a bigger price area, move back years, zoom, and full screen when the phone is turned",
+        "A price that could not be fetched in market hours shows “could not fetch”, never an old figure",
+        "Move-the-buttons mode: drag a button into Diagnostics, or out of it",
+    ],
+}
 
 
 if __name__ == "__main__":
