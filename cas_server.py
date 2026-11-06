@@ -28601,33 +28601,61 @@ def mkt_insider():
             except ValueError:
                 continue
             if d >= cut:
-                filed.setdefault(sym, []).append(d.isoformat())
-        out = []
-        t1 = datetime.date.today()
-        for sym in sorted(filed)[:25]:
-            ref = "https://www.nseindia.com/get-quotes/equity?symbol=" + Q(sym)
-            rows, err2 = _nse_rows(
-                "https://www.nseindia.com/api/corporates-pit?index=equities&"
-                "symbol=%s&from_date=%s&to_date=%s" % (
-                    Q(sym), (t1 - datetime.timedelta(days=30)).strftime(
-                        "%d-%m-%Y"), t1.strftime("%d-%m-%Y")), ref)
-            det = []
-            for r in (rows or [])[:8]:
-                det.append({"who": str(pick(r, ["acqName"]) or "")[:60],
-                            "role": str(pick(r, ["personCategory"]) or "")
-                            [:40],
-                            "type": str(pick(r, ["tdpTransactionType",
-                                                 "acqMode"]) or "")[:20],
-                            "qty": to_number(pick(r, ["secAcq"])),
-                            "value": to_number(pick(r, ["secVal"])),
-                            "date": str(pick(r, ["acqfromDt", "date",
-                                                 "intimDt"]) or "")[:11]})
-            out.append({"sym": sym, "filed": sorted(set(filed[sym]),
+                filed.setdefault(sym, []).append(
+                    (d.isoformat(), str(r.get("xmlFileName") or "")))
+        # each filing's own XBRL file carries who, what and how many (the
+        # older corporates-pit list stops in April 2026 - checked 6 Nov)
+        out, n_read = [], 0
+        for sym in sorted(filed):
+            det, errs = [], []
+            for d, url in sorted(filed[sym], reverse=True):
+                if not url:
+                    continue
+                if url not in PIT_XML and n_read >= 60:
+                    errs.append("more filings not read")
+                    break
+                try:
+                    if url not in PIT_XML:
+                        n_read += 1
+                        PIT_XML[url] = pit_xml_rows(_tt_get(url, timeout=20))
+                    det += [dict(x, filed=d) for x in PIT_XML[url]]
+                except Exception as e:
+                    errs.append(str(e)[:60])
+            out.append({"sym": sym, "filed": sorted({d for d, _u in
+                                                     filed[sym]},
                                                     reverse=True),
-                        "rows": det, "err": err2 if rows is None else ""})
+                        "rows": det[:20], "err": "; ".join(errs[:2])})
         return {"ok": True, "rows": out, "since": cut.isoformat(),
                 "watching": len(mine)}
     return _mkt_cached("insider", 2 * 3600, make)
+
+
+PIT_XML = {}
+
+
+def pit_xml_rows(raw):
+    """An insider-trading (PIT) XBRL filing -> one row per disclosure."""
+    vals = {}
+    for tag, ctx, v in re.findall(r"<in-bse-co:(\w+)[^>]*?contextRef=\"([^\"]+)"
+                                  r"\"[^>]*>([^<]*)</in-bse-co:\1>", raw):
+        vals.setdefault(ctx, {})[tag] = html_lib.unescape(v).strip()
+    rows = []
+    for g in vals.values():
+        if not g.get("NameOfThePerson"):
+            continue
+        rows.append({
+            "who": g.get("NameOfThePerson", "")[:60],
+            "role": g.get("CategoryOfPerson", "")[:40],
+            "type": (g.get("SecuritiesAcquiredOrDisposedTransactionType")
+                     or g.get("ModeOfAcquisitionOrDisposal") or "")[:30],
+            "mode": g.get("ModeOfAcquisitionOrDisposal", "")[:40],
+            "qty": to_number(g.get(
+                "SecuritiesAcquiredOrDisposedNumberOfSecurity")),
+            "value": to_number(g.get(
+                "SecuritiesAcquiredOrDisposedValueOfSecurity")),
+            "date": g.get("DateOfAllotmentAdviceOrAcquisitionOfSharesOr"
+                          "SaleOfSharesSpecifyFromDate", "")[:10]})
+    return rows
 
 
 def mkt_delivery():
