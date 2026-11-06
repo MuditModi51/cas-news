@@ -26,6 +26,18 @@ jobs:
           path: state.json
           key: news-${{ github.workflow }}-${{ github.run_id }}
           restore-keys: news-${{ github.workflow }}-
+      - name: Prices and news for the phone, at the start of the run
+        # 20.17: written before AND after the news run, so with the laptop
+        # off the phone's prices are never much more than half an hour old
+        if: ${{ hashFiles('snapshot.py') != '' && hashFiles('cas_server.py') != '' }}
+        env:
+          WATCH: ${{ secrets.WATCH }}
+        run: |
+          python3 snapshot.py || exit 0
+          git config user.name "cas-news"
+          git config user.email "cas-news@users.noreply.github.com"
+          git add snapshot.json
+          git commit -m "snapshot" -q && (git push -q || (git pull --rebase -q && git push -q)) || true
       - name: Send new headlines
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
