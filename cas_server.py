@@ -28454,9 +28454,10 @@ FIIDII_FILE = os.path.join(DATA_DIR, "fiidii.json")
 SECTOR_INDICES = ["NIFTY BANK", "NIFTY IT", "NIFTY AUTO", "NIFTY FMCG",
                   "NIFTY PHARMA", "NIFTY METAL", "NIFTY ENERGY",
                   "NIFTY REALTY", "NIFTY MEDIA", "NIFTY PSU BANK",
-                  "NIFTY FINANCIAL SERVICES", "NIFTY OIL & GAS",
-                  "NIFTY HEALTHCARE INDEX", "NIFTY CONSUMER DURABLES",
-                  "NIFTY PRIVATE BANK", "NIFTY CHEMICALS"]
+                  "NIFTY FIN SERVICE", "NIFTY OIL AND GAS",
+                  "NIFTY HEALTHCARE", "NIFTY CONSR DURBL",
+                  "NIFTY PVT BANK", "NIFTY CHEMICALS"]
+# (NSE's own short names - checked 6 Nov 2026: the long names answer empty)
 
 
 def my_symbols(state=None):
