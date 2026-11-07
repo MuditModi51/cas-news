@@ -169,7 +169,7 @@ MACRO_WORDS = [
     "bond yield", "interest rate", "stimulus", "policy", "sector", "circuit",
 ]
 
-VERSION = "20.19"
+VERSION = "20.23"
 
 # Always shown
 INDICES = [
@@ -1019,6 +1019,289 @@ def load_state():
 REQ = threading.local()
 
 
+# ---- 20.23: the master history of every change he makes --------------------------
+# Every save made by a request from the page or the phone (never by a timed
+# job) is compared with the file as it was, and what changed - path by path,
+# rows of the Accounts by their id - is kept in Data/history.json. From
+# Diagnostics (behind the profile password) any entry can be undone on its
+# own, the dashboard taken back to just before it, or an undone one done
+# again; entries can be reordered and deleted. Nothing is removed unless he
+# deletes it.
+CHG_LOCK = threading.RLock()
+CHG_GONE, CHG_NONE = "__gone__", "__none__"
+CHG_SKIP = {"saved", "note", "savedAt", "rev", "ts", "_t", "updated",
+             "lastSave", "fy"}
+CHG_NAMES = {"cas_state.json": "Table and settings", "accounts.json": "Accounts",
+              "accounts_ui.json": "Accounts look", "portfolio.json": "Portfolio",
+              "alerts.json": "Alerts"}
+
+
+def chg_path():
+    return os.path.join(os.path.dirname(PATHS["state"]), "history.json")
+
+
+def _chg_idlist(x):
+    return isinstance(x, list) and all(isinstance(e, dict) and "id" in e
+                                       for e in x) and \
+        len({str(e["id"]) for e in x}) == len(x)
+
+
+def _chg_diff(a, b, path, out):
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in sorted(set(a) | set(b), key=str):
+            if not path and k in CHG_SKIP:
+                continue
+            if k not in b:
+                out.append([path + [k], a[k], CHG_GONE, None])
+            elif k not in a:
+                out.append([path + [k], CHG_NONE, b[k], None])
+            elif a[k] != b[k]:
+                _chg_diff(a[k], b[k], path + [k], out)
+        return
+    if isinstance(a, list) and isinstance(b, list) and (a or b) and \
+            _chg_idlist(a) and _chg_idlist(b):
+        am = {str(e["id"]): (i, e) for i, e in enumerate(a)}
+        bm = {str(e["id"]): (i, e) for i, e in enumerate(b)}
+        for k in list(am) + [x for x in bm if x not in am]:
+            if k not in bm:
+                i = am[k][0]
+                out.append([path + ["#" + k], am[k][1], CHG_GONE,
+                            str(a[i - 1]["id"]) if i else None])
+            elif k not in am:
+                i = bm[k][0]
+                out.append([path + ["#" + k], CHG_NONE, bm[k][1],
+                            str(b[i - 1]["id"]) if i else None])
+            elif am[k][1] != bm[k][1]:
+                _chg_diff(am[k][1], bm[k][1], path + ["#" + k], out)
+        ao = [str(e["id"]) for e in a if str(e["id"]) in bm]
+        bo = [str(e["id"]) for e in b if str(e["id"]) in am]
+        if ao != bo:
+            out.append([path + ["#order"], ao, bo, None])
+        return
+    out.append([path, a, b, None])
+
+
+def _chg_walk(root, path):
+    cur = root
+    for k in path:
+        if isinstance(k, str) and k.startswith("#") and isinstance(cur, list):
+            cur = next((e for e in cur if str(e.get("id")) == k[1:]), None)
+        elif isinstance(cur, dict):
+            cur = cur.get(k)
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _chg_get(root, path):
+    if not path:
+        return root
+    par = _chg_walk(root, path[:-1])
+    k = path[-1]
+    if par is None:
+        return CHG_GONE
+    if k == "#order" and isinstance(par, list):
+        return [str(e.get("id")) for e in par]
+    if isinstance(k, str) and k.startswith("#") and isinstance(par, list):
+        e = next((e for e in par if str(e.get("id")) == k[1:]), None)
+        return CHG_GONE if e is None else e
+    if isinstance(par, dict):
+        return par.get(k, CHG_GONE)
+    return CHG_GONE
+
+
+def _chg_set(root, path, val, nb):
+    """Puts one value back (val GONE = take it out). False if the place
+    is no longer there."""
+    if not path:
+        return False
+    par = _chg_walk(root, path[:-1])
+    k = path[-1]
+    if par is None:
+        return False
+    if k == "#order" and isinstance(par, list):
+        pos = {x: i for i, x in enumerate(val or [])}
+        keep = [e for e in par if str(e.get("id")) not in pos]
+        par[:] = sorted([e for e in par if str(e.get("id")) in pos],
+                        key=lambda e: pos[str(e.get("id"))]) + keep
+        return True
+    if isinstance(k, str) and k.startswith("#") and isinstance(par, list):
+        i = next((n for n, e in enumerate(par) if str(e.get("id")) == k[1:]), None)
+        if val in (CHG_GONE, CHG_NONE):
+            if i is not None:
+                par.pop(i)
+            return True
+        if i is not None:
+            par[i] = val
+        else:
+            j = next((n for n, e in enumerate(par) if nb and str(e.get("id")) == nb), None)
+            par.insert(0 if j is None else j + 1, val)
+        return True
+    if isinstance(par, dict):
+        if val in (CHG_GONE, CHG_NONE):
+            par.pop(k, None)
+        else:
+            par[k] = val
+        return True
+    return False
+
+
+def _chg_label(fname, ch, old=None, new=None):
+    parts = []
+    for p, a, b, _n in ch[:40]:
+        q = [str(x).lstrip("#") for x in p if str(x) != "#order"][:3]
+        row = None
+        if len(p) >= 2 and str(p[1]).startswith("#"):
+            row = _chg_walk(new, p[:2]) if new is not None else None
+            row = row or (_chg_walk(old, p[:2]) if old is not None else None)
+        verb = "added " if a == CHG_NONE and len(p) == 2 else "deleted " if b == CHG_GONE and len(p) == 2 else ""
+        if fname == "cas_state.json" and len(q) >= 3 and q[0] == "notes":
+            parts.append("%s %s" % (q[1], q[2].upper()))
+        elif fname == "accounts.json" and q[:1] == ["tx"] and isinstance(row, dict):
+            parts.append("%srow %s %s %s%s" % (verb, row.get("date", ""), row.get("type", ""),
+                                               row.get("sym", ""), (" " + q[2]) if len(q) > 2 else ""))
+        elif fname == "accounts.json" and q[:1] == ["tx"]:
+            parts.append("row order" if p[-1] == "#order" else "rows")
+        elif fname == "portfolio.json" and isinstance(row, dict):
+            parts.append("%s%s %s" % (verb, row.get("type", ""), row.get("name") or row.get("sym") or ""))
+        else:
+            parts.append(" ".join(q[:2]) or "everything")
+    seen = list(dict.fromkeys(parts))
+    return ", ".join(seen[:4]) + (" and %d more" % (len(seen) - 4) if len(seen) > 4 else "")
+
+
+def chg_record(fname, old, new):
+    """Called with the file as it was and as it is now saved."""
+    who = getattr(REQ, "user", False)
+    if not who or old is None or new is None:
+        return
+    try:
+        ch = []
+        _chg_diff(old, new, [], ch)
+        if not ch:
+            return
+        with CHG_LOCK:
+            h = _read_json(chg_path(), {"items": []})
+            if not isinstance(h, dict):
+                h = {"items": []}
+            items = h.setdefault("items", [])
+            items.append({"id": secrets.token_hex(5), "t": time.time(),
+                          "file": fname, "src": who if isinstance(who, str) else "page",
+                          "what": CHG_NAMES.get(fname, fname) + ": " + _chg_label(fname, ch, old, new),
+                          "ch": ch, "on": True})
+            if len(items) > 3000:              # very old ones only past 3000
+                del items[:len(items) - 3000]
+            _write_json(chg_path(), h)
+    except Exception:
+        pass
+
+
+def _chg_io(fname):
+    """(read, write) for a file the history can change."""
+    if fname == "cas_state.json":
+        return (lambda: _read_json(PATHS["state"], None)), save_state
+    if fname == "accounts.json":
+        return acc_load, (lambda d: acc_save(d, "history"))
+    if fname == "accounts_ui.json":
+        return acc_ui, acc_ui_save
+    if fname == "portfolio.json":
+        return portfolio_load, portfolio_save
+    if fname == "alerts.json":
+        return (lambda: _read_json(ALERT_FILE, None)), _chg_alerts_write
+    return None, None
+
+
+def _chg_alerts_write(d):
+    _write_json(ALERT_FILE, d)
+    for k in ("items", "sound", "volume"):
+        if k in d:
+            ALERTS[k] = d[k]
+
+
+CHG_KEYS = {}
+
+
+def chg_action(data):
+    act = str(data.get("action") or "")
+    if act == "open":
+        p = profile_read()
+        if p.get("hash") and not pw_check(str(data.get("password") or ""),
+                                          p.get("salt"), p.get("hash")):
+            time.sleep(1.0)
+            return {"ok": False, "error": "That is not the password."}
+        k = secrets.token_hex(12)
+        CHG_KEYS.clear()
+        CHG_KEYS[k] = time.time() + 1800
+        data = dict(data, key=k, action="list")
+        act = "list"
+    if CHG_KEYS.get(str(data.get("key") or ""), 0) < time.time():
+        return {"ok": False, "locked": True, "error": "Type the password again."}
+    with CHG_LOCK:
+        h = _read_json(chg_path(), {"items": []})
+        items = h.get("items") or []
+        if act == "list":
+            out = [{"id": e["id"], "t": e["t"], "file": e["file"], "src": e.get("src"),
+                    "what": e.get("what"), "on": e.get("on", True), "n": len(e.get("ch") or []),
+                    "detail": [[".".join(str(x).lstrip("#") for x in c[0]),
+                                str(c[1])[:80], str(c[2])[:80]] for c in (e.get("ch") or [])[:6]]}
+                   for e in items]
+            return {"ok": True, "items": out, "key": data.get("key")}
+        ids = [str(x) for x in (data.get("ids") or [])]
+        if act in ("delete", "move"):
+            if act == "delete":
+                h["items"] = [e for e in items if e["id"] not in ids]
+            else:
+                i = next((n for n, e in enumerate(items) if e["id"] == (ids or [""])[0]), None)
+                j = (i or 0) + (1 if data.get("dir") == "later" else -1)
+                if i is not None and 0 <= j < len(items):
+                    items[i], items[j] = items[j], items[i]
+            _write_json(chg_path(), h)
+            return {"ok": True}
+        if act not in ("undo", "redo", "back"):
+            return {"ok": False, "error": "Unknown"}
+        if act == "back":           # this one and every later one still in force
+            i = next((n for n, e in enumerate(items) if e["id"] == (ids or [""])[0]), None)
+            if i is None:
+                return {"ok": False, "error": "Not found"}
+            todo = [e for e in items[i:] if e.get("on", True)][::-1]
+        else:
+            todo = [e for e in items if e["id"] in ids and
+                    bool(e.get("on", True)) == (act == "undo")]
+        files, skipped, done = {}, 0, 0
+        for e in todo:
+            rd, _wr = _chg_io(e["file"])
+            if rd is None:
+                continue
+            if e["file"] not in files:
+                files[e["file"]] = rd()
+            root = files[e["file"]]
+            if root is None:
+                continue
+            undo = act != "redo"
+            for p, a, b, nb in (e.get("ch") or [])[::-1] if undo else (e.get("ch") or []):
+                want_now, put = (b, a) if undo else (a, b)
+                cur = _chg_get(root, p)
+                if cur != want_now and not (cur == CHG_GONE and want_now == CHG_NONE):
+                    skipped += 1        # changed again later: left as it is
+                    continue
+                if _chg_set(root, p, put, nb):
+                    done += 1
+            e["on"] = not undo
+        for f, root in files.items():
+            _rd, wr = _chg_io(f)
+            if root is not None:
+                saved_user = getattr(REQ, "user", False)
+                REQ.user = False        # going back is not itself a new entry
+                try:
+                    wr(root)
+                finally:
+                    REQ.user = saved_user
+        _write_json(chg_path(), h)
+    return {"ok": True, "done": done, "skipped": skipped, "entries": len(todo)}
+
+
 class ProfileMoved(Exception):
     pass
 
@@ -1033,10 +1316,12 @@ def save_state(state):
         if not req_pid_ok():
             raise ProfileMoved()
         with STATE_LOCK:
+            old = _read_json(PATHS["state"], None) if getattr(REQ, "user", False) else None
             tmp = PATHS["state"] + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(state, f, indent=2)
             os.replace(tmp, PATHS["state"])
+            chg_record("cas_state.json", old, json.loads(json.dumps(state)))
 
 
 ACTIVE_KEYS = ("buy", "purchase", "target")
@@ -1962,12 +2247,14 @@ def alerts_save(payload=None):
         if "volume" in payload:
             ALERTS["volume"] = payload["volume"]
     try:
+        old = _read_json(ALERT_FILE, None) if getattr(REQ, "user", False) else None
         tmp = ALERT_FILE + ".tmp"
+        new = {"items": ALERTS["items"], "sound": ALERTS["sound"],
+               "volume": ALERTS["volume"], "casNew": bool(ALERTS.get("casNew"))}
         with open(tmp, "w") as f:
-            json.dump({"items": ALERTS["items"], "sound": ALERTS["sound"],
-                       "volume": ALERTS["volume"],
-                       "casNew": bool(ALERTS.get("casNew"))}, f, indent=1)
+            json.dump(new, f, indent=1)
         os.replace(tmp, ALERT_FILE)
+        chg_record("alerts.json", old, json.loads(json.dumps(new)))
     except Exception:
         pass
     return {"ok": True}
@@ -5060,27 +5347,27 @@ def _fetch_ipos_now():
         minamt = d.get("minAmount")
         if not minamt and top and lotn:
             minamt = str(round(top * lotn))
-        gmpn = _gmp_num(r["gmp"])
-        listing = r["listing"]
+        gmpn = _gmp_num(r.get("gmp"))            # 20.23: a row may lack any of these
+        listing = r.get("listing") or ""
         if not listing and top and gmpn is not None:
             listing = "₹" + str(round(top + gmpn))
-        gain = r["gainPct"]
+        gain = r.get("gainPct") or ""
         if not gain and top and gmpn is not None:
             gain = "%.2f%%" % (gmpn / top * 100)
         n = nse.get(_ipo_key(r["name"]), {})
         rows.append({
-            "name": r["name"], "gmp": gmpn, "gmpText": r["gmp"],
+            "name": r["name"], "gmp": gmpn, "gmpText": r.get("gmp") or "",
             "board": r.get("board", ""), "symbol": n.get("symbol", ""),
             "band": band, "listing": listing, "gainPct": gain,
-            "dates": r["dates"], "status": r["status"] or n.get("status", ""),
+            "dates": r.get("dates") or "", "status": r.get("status") or n.get("status", ""),
             "lot": lot, "minAmount": (int(float(minamt)) if minamt and
                                       re.fullmatch(r"[\d.]+", str(minamt))
                                       else None),
             "allotment": d.get("allotment", ""),
             "listDate": d.get("listDate", ""),
             "subscription": n.get("sub", ""),
-            "updated": r["updated"],
-            "readUrl": ipowatch_detail_url(r["link"]) or IPO_LIST_URL,
+            "updated": r.get("updated") or "",
+            "readUrl": ipowatch_detail_url(r.get("link") or "") or IPO_LIST_URL,
         })
     IPO_CACHE.update({"at": time.time(), "rows": rows,
                       "gmpSource": src, "error": err})
@@ -6233,6 +6520,7 @@ def fno_chain(sym="NIFTY", force=False, want_expiry=""):
             "peGamma": g_pe.get("gamma"), "peVega": g_pe.get("vega"),
         })
     out["chainRows"] = chain[:24]
+    out["chainAll"] = chain                # 20.23: every strike near the money, for the strategy builder
 
     # cost of carry: the futures premium annualised, which tells him whether
     # the roll is cheap or dear
@@ -9982,11 +10270,15 @@ ACC_LOCK = threading.RLock()
 ACC_CACHE = {"key": None, "data": None}
 ACC_TYPES = ("BUY", "SELL", "OPENING_CASH", "OPENING_SHARES", "FUND_ADD",
              "FUND_WITHDRAWAL", "EXPENSE", "BONUS", "SPLIT", "RIGHTS_ISSUE",
-             "DEMERGER", "BUYBACK")
+             "DEMERGER", "BUYBACK", "PLEDGE", "UNPLEDGE")
+# 20.20: PLEDGE / UNPLEDGE mark shares given as margin collateral - no cash
+# and no shares move; the pledge charge is its own EXPENSE row PLEDGE_FEE
+ACC_PLEDGE_TYPES = ("PLEDGE", "UNPLEDGE")
 ACC_LOT_TYPES = ("OPENING_SHARES", "BONUS", "SPLIT", "RIGHTS_ISSUE",
                  "DEMERGER")
 ACC_MONEY_TYPES = ("OPENING_CASH", "FUND_ADD", "FUND_WITHDRAWAL", "EXPENSE")
-ACC_EXPENSES = ["AMC", "PAYMENT_GATEWAY", "BUYBACK_FEE", "CHARGES_ADJ"]
+ACC_EXPENSES = ["AMC", "PAYMENT_GATEWAY", "BUYBACK_FEE", "CHARGES_ADJ",
+                "PLEDGE_FEE", "MARGIN_INTEREST"]
 ACC_PASSIVE = ["DIVIDEND", "INTEREST"]
 # 20.16: what a BUY / SELL row is - (name, Profile kind, taxed like shares).
 # Charges are worked out for shares only (the broker's rates for equity);
@@ -10383,6 +10675,18 @@ def acc_compute(acc, broker=None, today=None, upto=None):
                    not r["yes"])
         lots = lots_of.get(s, [])
         h = {"sym": s, "qty": q if abs(q) > 1e-9 else None}
+        # 20.20: shares pledged as margin (never more than are held)
+        pq = sum(t["qty"] or 0 for t in tx if t["sym"] == s and
+                 t["type"] == "PLEDGE") - \
+            sum(t["qty"] or 0 for t in tx if t["sym"] == s and
+                t["type"] == "UNPLEDGE")
+        if pq > 1e-9 and h["qty"]:
+            h["pledged"] = min(pq, h["qty"])
+            last = [t for t in tx if t["sym"] == s and t["type"] == "PLEDGE"
+                    and _anum(t.get("margin"))]
+            if last:
+                per = _anum(last[-1].get("margin")) / (last[-1]["qty"] or 1)
+                h["collateral"] = per * h["pledged"]
         if h["qty"] is not None:
             h["invested"] = cin - cout
             h["avg"] = xround(h["invested"] / q, 2)
@@ -10449,7 +10753,13 @@ def acc_compute(acc, broker=None, today=None, upto=None):
         "amc": abs(sumtx("net", "EXPENSE", "AMC")),
         "gateway": abs(sumtx("net", "EXPENSE", "PAYMENT_GATEWAY")),
         "otherExp": abs(sumtx("net", "EXPENSE", "BUYBACK_FEE")) +
-        abs(sumtx("net", "EXPENSE", "CHARGES_ADJ")),
+        abs(sumtx("net", "EXPENSE", "CHARGES_ADJ")) +
+        abs(sumtx("net", "EXPENSE", "PLEDGE_FEE")) +
+        abs(sumtx("net", "EXPENSE", "MARGIN_INTEREST")),
+        "pledgeFees": abs(sumtx("net", "EXPENSE", "PLEDGE_FEE")),
+        "marginInterest": abs(sumtx("net", "EXPENSE", "MARGIN_INTEREST")),
+        "pledgedShares": sum(1 for h in hold if h.get("pledged")),
+        "collateral": sum(h.get("collateral") or 0 for h in hold),
         "totalOtherExp": other_exp}
     dash["fundsNet"] = dash["fundsAdded"] - dash["fundsWithdrawn"]
     dash["passive"] = dash["dividends"] + dash["interest"]
@@ -10768,7 +11078,9 @@ def acc_save(acc, note=""):
         acc["saved"] = time.strftime("%d %b %Y %H:%M")
         acc["note"] = note[:80]
         acc.setdefault("fy", acc_fy_of(datetime.date.today()))
+        old = _read_json(p, None) if getattr(REQ, "user", False) else None
         _write_json(p, acc)
+        chg_record("accounts.json", old, json.loads(json.dumps(acc)))
         ACC_CACHE["key"] = None
         ACC_CHECK["key"] = None
 
@@ -10786,7 +11098,9 @@ def acc_ui():
 
 
 def acc_ui_save(d):
+    old = _read_json(acc_ui_path(), None) if getattr(REQ, "user", False) else None
     _write_json(acc_ui_path(), d)
+    chg_record("accounts_ui.json", old, json.loads(json.dumps(d)))
     _RATE_CACHE["at"] = None      # 20.19: a rate may have changed
 
 
@@ -10921,6 +11235,10 @@ def _acc_row(data):
         row["netIn"] = 0.0
         if kind == "OPENING_SHARES":
             row["exch"] = "NSE"
+        if kind == "PLEDGE":
+            m = _anum(r.get("margin"))
+            if m is not None and m != 0:
+                row["margin"] = abs(m)
     return row
 
 
@@ -12472,13 +12790,20 @@ CN_IMG_PROMPT = (
     "receivable by the client, negative when payable).")
 
 
-def cn_from_image(data, mime):
+def cn_from_image(pics):
+    """pics: [(base64, mime)] - the pages of ONE contract note (20.20)."""
     if not GEMINI["key"]:
         return None, ("Reading a photo needs Gemini: set the Ask key in "
                       "Diagnostics (it is free). A PDF is read without it.")
-    raw, why = gemini_parts([{"text": CN_IMG_PROMPT},
-                             {"inline_data": {"mime_type": mime,
-                                              "data": data}}], timeout=60)
+    lead = CN_IMG_PROMPT if len(pics) == 1 else (
+        "These %d pictures are pages of ONE contract note, in any order: "
+        "take the trade date and note number from whichever page shows "
+        "them, the trades from the trade page, and each trade's exchange "
+        "from the exchange-wise annexure if it is among them; if no page "
+        "shows the exchange, leave exch null.\n" % len(pics)) + CN_IMG_PROMPT
+    parts = [{"text": lead}] + [{"inline_data": {"mime_type": m, "data": d}}
+                                for d, m in pics]
+    raw, why = gemini_parts(parts, timeout=90)
     if raw is None:
         return None, "Gemini did not answer (%s)." % why
     m = re.search(r"\{.*\}", raw, re.S)
@@ -12489,6 +12814,13 @@ def cn_from_image(data, mime):
     if not isinstance(d, dict):
         return None, "Gemini's answer could not be read - try a clearer " \
                      "picture, or the PDF."
+    # 20.20: an exchange no page showed is named, not quietly taken as NSE
+    unk = [str(t.get("sym") or "?") for t in d.get("trades") or []
+           if isinstance(t, dict) and not str(t.get("exch") or "").strip()]
+    if unk:
+        d["warn"] = list(d.get("warn") or []) + [
+            "The exchange of %s was not in the pictures - NSE is filled in; "
+            "check it against the note's annexure." % ", ".join(unk[:10])]
     return cn_clean(d), ""
 
 
@@ -13073,6 +13405,16 @@ def accounts_action(data):
                 raw = _b64.b64decode(str(f.get("data") or "").split(",")[-1])
             except Exception:
                 raw = b""
+            # 20.20: every page of one note as pictures, read together
+            pics = []
+            for g in (data.get("files") or [])[:8]:
+                try:
+                    b = _b64.b64decode(str((g or {}).get("data") or "")
+                                       .split(",")[-1])
+                except Exception:
+                    b = b""
+                if b and b[:4] != b"%PDF":
+                    pics.append((b, str((g or {}).get("mime") or "")))
             if not raw:
                 return {"ok": False, "error": "Choose the contract note."}
             if len(raw) > 20 * 1024 * 1024:
@@ -13091,13 +13433,17 @@ def accounts_action(data):
                             % str(e)[:80]}
                 src = "pdf"
             else:
-                mime = str(f.get("mime") or "")
-                if not re.fullmatch(r"image/(png|jpe?g|webp|heic|heif)",
-                                    mime):
+                if not pics:
+                    pics = [(raw, str(f.get("mime") or ""))]
+                if sum(len(b) for b, _m in pics) > 20 * 1024 * 1024:
+                    return {"ok": False, "error": "Those pictures are too "
+                            "big together (20 MB at most)."}
+                if any(not re.fullmatch(r"image/(png|jpe?g|webp|heic|heif)",
+                                        m) for _b, m in pics):
                     return {"ok": False, "error": "Choose the note's PDF, "
-                            "or a photo or screenshot of it."}
+                            "or photos or screenshots of it."}
                 note, why = cn_from_image(
-                    _b64.b64encode(raw).decode("ascii"), mime)
+                    [(_b64.b64encode(b).decode("ascii"), m) for b, m in pics])
                 if note is None:
                     return {"ok": False, "error": why}
                 src = "photo"
@@ -13253,6 +13599,18 @@ def accounts_action(data):
                     at = at_pos
                 else:
                     at = _acc_place(acc["tx"], row)
+                # 20.20: a new PLEDGE row brings its charge as an EXPENSE
+                # row PLEDGE_FEE the same day (saved together, one Undo)
+                fee = _anum(data.get("pledgeFee"))
+                if row["type"] == "PLEDGE" and not isinstance(i, int) and \
+                        fee and fee > 0:
+                    _acc_place(acc["tx"], {
+                        "id": secrets.token_hex(5), "date": row["date"],
+                        "type": "EXPENSE", "sym": "PLEDGE_FEE",
+                        "netIn": -abs(fee), "note": "pledge of %s %s" % (
+                            "{:g}".format(row["qty"]), row["sym"])})
+                    at = next((k for k, x in enumerate(acc["tx"])
+                               if x is row), at)
                 n = acc_mark_intraday(acc["tx"], {row["date"]}) \
                     if row["type"] in ("BUY", "SELL") and \
                     data.get("autoIntra", True) else 0
@@ -14127,7 +14485,9 @@ def portfolio_load():
 
 
 def portfolio_save(d):
+    old = _read_json(portfolio_path(), None) if getattr(REQ, "user", False) else None
     _write_json(portfolio_path(), d)
+    chg_record("portfolio.json", old, json.loads(json.dumps(d)))
 
 
 def _pdate(s, default=None):
@@ -16003,7 +16363,8 @@ def tax_path():
 TAX_ENTITIES = {"individual": "Individual", "huf": "HUF",
                 "firm": "Partnership firm", "llp": "LLP",
                 "company": "Company (domestic)",
-                "opc": "One Person Company", "aop": "AOP / BOI"}
+                "opc": "One Person Company", "aop": "AOP / BOI",
+                "trust": "Trust (charitable or private)"}
 TAX_CG_TYPES = {
     "listed_equity": "Listed shares / equity mutual funds (STT paid)",
     "other_listed": "Other listed securities (bonds, gold ETF, REIT...)",
@@ -16123,6 +16484,102 @@ def _old_slabs(entity, age, resident):
     return [(250000, 0), (500000, .05), (1000000, .20), (None, .30)]
 
 
+# ---- 20.23: his own figures in place of the Act's (rates, slabs, amounts) ----
+TAX_OVER_KEYS = {"newSlabs": "New-regime slabs", "oldSlabs": "Old-regime slabs",
+                 "newStd": "Standard deduction (new)", "oldStd": "Standard deduction (old)",
+                 "newRebate": "87A rebate (new): [income limit, most]",
+                 "oldRebate": "87A rebate (old): [income limit, most]",
+                 "stEq": "STCG on listed shares (111A)", "ltEq": "LTCG on listed shares (112A)",
+                 "ltEqFree": "LTCG 112A exempt amount", "lt": "Other LTCG (112)",
+                 "ltIdx": "LTCG with indexation", "flat30": "Flat 30% items",
+                 "amt": "AMT rate", "mat": "MAT rate"}
+
+
+def _tax_over(R, over):
+    """The year's rates with his own changes laid over them."""
+    if not R or not isinstance(over, dict):
+        return R
+    R = dict(R)
+    used = []
+    for k, v in over.items():
+        if k not in TAX_OVER_KEYS or v in (None, ""):
+            continue
+        try:
+            if k in ("newSlabs", "oldSlabs"):
+                sl = [(None if t in (None, "") else float(t), float(r)) for t, r in v]
+                if not sl or sl[-1][0] is not None:
+                    continue
+                R[k] = sl
+            elif k in ("newRebate", "oldRebate"):
+                R[k] = (float(v[0]), float(v[1]))
+            else:
+                R[k] = float(v)
+            used.append(TAX_OVER_KEYS[k])
+        except (TypeError, ValueError, IndexError):
+            continue
+    if used:
+        R["overridden"] = used
+    return R
+
+
+def _floor100(v):
+    return math.floor(max(0.0, v) / 100.0) * 100.0
+
+
+def _tax_interest(inp, fy, assessed):
+    """Interest for advance tax paid late or short: 234C (instalments) and
+    234B (less than 90% paid by 31 March), 1% a month, part of a month
+    counted as a month, amounts rounded down to Rs 100."""
+    out = {"b": 0.0, "c": 0.0, "bhow": "", "chow": "", "asks": []}
+    y = _fy_year(fy)
+    if not y or assessed < 10000:
+        return out
+    pd = inp.get("paid") or {}
+    lst = []
+    for x in pd.get("advList") or []:
+        if isinstance(x, dict) and _tn(x.get("amount")) and _pdate(x.get("date")):
+            lst.append((_pdate(x.get("date")), _tn(x.get("amount"))))
+    adv_typed = _tn(pd.get("advance"))
+    if adv_typed and not lst:
+        out["asks"].append({"path": "paid.advList", "kind": "advlist",
+                            "q": "On which dates was the advance tax of Rs %s paid? "
+                                 "Add each payment with its date - interest under "
+                                 "234C depends on them." % _inr0(adv_typed)})
+    paid = lst
+    b = (inp.get("biz") or {})
+    presumptive = bool(_tn(b.get("ad_digital")) or _tn(b.get("ad_cash")) or _tn(b.get("ada")))
+    sched = ([(datetime.date(y + 1, 3, 15), 1.0, 1, None)] if presumptive else
+             [(datetime.date(y, 6, 15), .15, 3, .12), (datetime.date(y, 9, 15), .45, 3, .36),
+              (datetime.date(y, 12, 15), .75, 3, None), (datetime.date(y + 1, 3, 15), 1.0, 1, None)])
+    if lst or not adv_typed:
+        how = []
+        for due, frac, months, leeway in sched:
+            by = sum(a for d, a in paid if d <= due)
+            if leeway is not None and by >= assessed * leeway:
+                continue
+            short = _floor100(assessed * frac - by)
+            if short:
+                out["c"] += short * 0.01 * months
+                how.append("%s: Rs %s short x 1%% x %d" % (due.strftime("%d %b"), _inr0(short), months))
+        out["chow"] = "; ".join(how) + ("." if how else "") + (
+            " (44AD / 44ADA: all by 15 March.)" if presumptive else "")
+    adv_paid = sum(a for d, a in paid if d <= datetime.date(y + 1, 3, 31)) if lst else adv_typed
+    if adv_paid < 0.9 * assessed:
+        short = _floor100(assessed - adv_paid)
+        end = _pdate(pd.get("selfDate")) or datetime.date.today()
+        if not pd.get("selfDate"):
+            out["asks"].append({"path": "paid.selfDate", "kind": "date",
+                                "q": "Interest under 234B runs until the balance is paid. "
+                                     "On which date was (or will) the self-assessment tax "
+                                     "be paid? Left blank, today is used."})
+        months = max(1, (end.year - (y + 1)) * 12 + end.month - 4 + 1)
+        out["b"] = short * 0.01 * months
+        out["bhow"] = "Rs %s (assessed tax less advance tax, rounded down) x 1%% x %d months from 1 April %d to %s." % (
+            _inr0(short), months, y + 1, end.strftime("%d %b %Y"))
+    out["b"], out["c"] = round(out["b"]), round(out["c"])
+    return out
+
+
 def tax_load():
     return _read_json(tax_path(), {}) or {}
 
@@ -16168,7 +16625,32 @@ def tax_auto(fy):
     charge - STT is allowed against business income), dividends and
     interest as entered in Passive Income."""
     out = {"have": False, "stEq": 0.0, "ltEq": 0.0, "intraday": 0.0,
-           "dividend": 0.0, "interest": 0.0, "warn": []}
+           "dividend": 0.0, "interest": 0.0, "warn": [], "pfInterest": 0.0,
+           "pfRows": []}
+    # 20.23: interest earned in the year on deposits and bonds kept in the
+    # Portfolio (PPF, EPF and the other tax-free ones left out)
+    try:
+        y = _fy_year(fy)
+        if y:
+            a, z = datetime.date(y, 4, 1), min(datetime.date(y + 1, 3, 31), datetime.date.today())
+            for it in (portfolio_load().get("items") or []):
+                if not isinstance(it, dict) or it.get("type") not in (
+                        "fd", "rd", "nsc", "kvp", "scss", "pomis", "bond", "sgb", "other"):
+                    continue
+                if it.get("type") == "other" and not it.get("rate"):
+                    continue
+                st = _pdate(it.get("start") or it.get("buyDate"))
+                if not st or st > z:
+                    continue
+                i_end = portfolio_item_view(it, z, 0).get("interest") or 0.0
+                i_beg = portfolio_item_view(it, a - datetime.timedelta(days=1), 0).get(
+                    "interest") or 0.0 if st < a else 0.0
+                v = round(max(0.0, i_end - i_beg), 2)
+                if v:
+                    out["pfInterest"] += v
+                    out["pfRows"].append([it.get("name") or it.get("type"), v])
+    except Exception:
+        pass
     try:
         cur = (acc_load() or {}).get("fy")
         _a, v = acc_view(None if (not fy or fy == cur) else fy)
@@ -16367,6 +16849,7 @@ def _regime_calc(inp, auto, fy, regime, R):
     slabbed = ent in ("individual", "huf", "aop")
     new = regime == "new"
     lines, notes, warn = [], [], []
+    asks = []                       # 20.23: questions for him in place of limitations
 
     def L(label, amt, kind="row", help_=""):
         lines.append({"label": label, "amt": round(amt, 2), "kind": kind,
@@ -16500,8 +16983,18 @@ def _regime_calc(inp, auto, fy, regime, R):
     fp = _tn(os_.get("famPension"))
     fp_ded = min(fp / 3.0, R["famPen"]["new" if new else "old"]) if fp else 0
     other = _tn(os_.get("other"), True)
+    # 20.23: interest earned this year on deposits and bonds in the Portfolio
+    pfi = auto.get("pfInterest", 0.0) if use_auto and os_.get("pfInclude", True) is not False else 0.0
+    intr += pfi
     os_inc = div + intr + fp - fp_ded + other
     lottery = _tn(os_.get("lottery"))
+    trust_spec = 0.0
+    if ent == "trust":              # 20.23: anonymous donations (115BBC), specified income (115BBI)
+        tr = inp.get("trust") or {}
+        anon = _tn(tr.get("anon"))
+        tot_don = _tn(tr.get("donations")) + _tn(tr.get("corpus")) + anon
+        trust_spec = max(0.0, anon - max(100000.0, 0.05 * tot_don)) + _tn(tr.get("violation"))
+        lottery += trust_spec
     if os_inc or lottery or div:
         L("Income from other sources", os_inc + lottery, "head",
           "Dividends %s, interest %s%s%s%s." % (
@@ -16650,6 +17143,25 @@ def _regime_calc(inp, auto, fy, regime, R):
         notes.append("New regime: 80C, 80D and most other deductions are "
                      "not allowed; employer's NPS is.")
     ti_exact = gti - ded
+    if ent == "trust" and (inp.get("trust") or {}).get("kind", "charitable") != "private":
+        # 20.23: a charitable trust (s.11): what is applied to its objects,
+        # 15% set aside and what is accumulated with Form 10 are exempt
+        tr = inp.get("trust") or {}
+        don = _tn(tr.get("donations"))
+        normal_part = max(0.0, ti_exact - spec_rate_inc) + don
+        applied, f10 = _tn(tr.get("applied")), _tn(tr.get("form10"))
+        acc15 = 0.15 * normal_part
+        exempt = min(normal_part, applied + acc15 + f10)
+        L("Trust: voluntary contributions (not corpus, not anonymous)", don, "sub",
+          "Corpus donations are not income (s.11(1)(d)).")
+        L("Trust: less applied to its objects in the year", -min(applied, normal_part), "sub")
+        L("Trust: less 15% that may be accumulated (s.11(1)(a))", -min(acc15, max(0.0, normal_part - applied)), "sub")
+        if f10:
+            L("Trust: less set apart for up to 5 years with Form 10 (s.11(2))", -f10, "sub")
+        ti_exact = spec_rate_inc + max(0.0, normal_part - exempt)
+        if applied + f10 < 0.85 * normal_part:
+            notes.append("Less than 85%% was applied or set apart: the shortfall (Rs %s) is taxed." %
+                         _inr0(0.85 * normal_part - applied - f10))
     ti = _r10(ti_exact)
     L("Total income (rounded to the nearest Rs 10)", ti, "total")
 
@@ -16664,7 +17176,11 @@ def _regime_calc(inp, auto, fy, regime, R):
     elif new:
         slabs = R["newSlabs"]
     else:
-        slabs = _old_slabs(ent, age, resident)
+        slabs = R.get("oldSlabs") or _old_slabs(ent, age, resident)
+    mmr = (ent == "trust" and (inp.get("trust") or {}).get("kind") == "private") or \
+        (ent == "aop" and inp.get("aopShares") == "no")
+    if mmr:
+        slabs = [(None, R["flat30"])]          # 20.23: maximum marginal rate
     bel = slabs[0][0] if slabs[0][1] == 0 else 0.0
     sp = {"stEq": pools["stEq"], "ltEq": max(0.0, pools["ltEq"] -
                                              R["ltEqFree"]),
@@ -16694,7 +17210,7 @@ def _regime_calc(inp, auto, fy, regime, R):
                    ("lt125", "Tax on other long-term gains at 12.5%"),
                    ("lt20", "Tax on property gains with indexation at 20%"),
                    ("vda", "Tax on crypto / VDA at 30%"),
-                   ("lot", "Tax on lottery / game winnings at 30%")):
+                   ("lot", "Tax at 30%% on %s" % ("anonymous donations (115BBC) and specified income (115BBI)" if ent == "trust" else "lottery / game winnings"))):
         if t_sp[k]:
             L(lab, t_sp[k], "tax")
     tax = t_norm + sum(t_sp.values())
@@ -16733,6 +17249,8 @@ def _regime_calc(inp, auto, fy, regime, R):
         pools["lt20"] + div
     rest_inc = ti - capped_inc
     r_full, r_cap = _surcharge_rate(ent, regime, ti, rest_inc, scheme)
+    if mmr:                         # 20.23: the maximum marginal rate carries the top surcharge
+        r_full = .25 if regime == "new" else .37
     top = _slab_rate(normal, slabs)
     t_div = min(t_norm, div * top)
     t_cap = t_sp["stEq"] + t_sp["ltEq"] + t_sp["lt125"] + t_sp["lt20"] + \
@@ -16740,7 +17258,7 @@ def _regime_calc(inp, auto, fy, regime, R):
     t_cap = min(t_cap, tax_ar)
     sc = (tax_ar - t_cap) * r_full + t_cap * r_cap
     mr = 0.0
-    if sc:
+    if sc and not mmr:
         thr = max([t for t in _sc_thresholds(ent, regime, scheme)
                    if t < ti] or [0])
         if thr and normal >= ti - thr:
@@ -16818,17 +17336,34 @@ def _regime_calc(inp, auto, fy, regime, R):
     L("Total tax for the year (rounded to the nearest Rs 10)", total, "grand")
     pd = inp.get("paid") or {}
     tds = _tn(pd.get("tds")) + _tn(pd.get("tcs"))
-    adv = _tn(pd.get("advance")) + _tn(pd.get("self"))
+    adv_l = sum(_tn(x.get("amount")) for x in pd.get("advList") or [] if isinstance(x, dict))
+    adv = (_tn(pd.get("advance")) or adv_l) + _tn(pd.get("self"))
     if tds or adv:
         L("Less: TDS and TCS", -tds, "sub")
         L("Less: advance tax and self-assessment tax paid", -adv, "sub")
     bal = total - tds - adv
+    # 20.23: interest for advance tax paid late or short
+    i234 = _tax_interest(inp, fy, total - tds)
+    if i234["c"]:
+        L("Add: interest u/s 234C (instalments of advance tax short)", i234["c"], "sub", i234["chow"])
+    if i234["b"]:
+        L("Add: interest u/s 234B (advance tax below 90% of the tax)", i234["b"], "sub", i234["bhow"])
+    bal += i234["b"] + i234["c"]
+    asks.extend(i234["asks"])
     L("Tax still to pay" if bal > 0 else "Refund due" if bal < 0 else
       "Nothing more to pay", abs(bal), "grand",
-      "Before interest for late payment (234B / 234C), which is not worked "
-      "out here.")
-    if R.get("assumed"):
-        notes.append(R["assumed"])
+      "Including interest under 234B and 234C where due (234A, for a "
+      "return filed late, is not included).")
+    if R.get("assumed") and not R.get("overridden"):
+        asks.append({"path": "_rates", "kind": "rates", "q": R["assumed"] +
+                     " If any rate, slab or amount is different, change it under "
+                     "'Rates used' (or tell Gemini, e.g. 'the LTCG rate is now 15%')."})
+    if R.get("overridden"):
+        notes.append("Your own figures are used for: " + ", ".join(R["overridden"]) + ".")
+    if ent == "aop" and inp.get("aopShares") in (None, ""):
+        asks.append({"path": "aopShares", "kind": "yesno",
+                     "q": "Are the members' shares in the AOP / BOI known and fixed? "
+                          "(If not, the whole income is taxed at the maximum marginal rate.)"})
     cfl = {k: round(v, 2) for k, v in c_f.items() if v > 0.5}
     if cfl:
         notes.append("Losses carried forward: " + ", ".join(
@@ -16839,7 +17374,8 @@ def _regime_calc(inp, auto, fy, regime, R):
                            "ltcl": "long-term capital (8 years)"}[k],
                           _inr0(v)) for k, v in cfl.items()) +
             ". Only if the return is filed by its due date.")
-    return {"regime": regime, "lines": lines, "notes": notes, "warn": warn,
+    return {"regime": regime, "lines": lines, "notes": notes, "warn": warn, "asks": asks,
+            "i234": {"b": i234["b"], "c": i234["c"]},
             "gti": round(gti, 2), "ded": round(ded, 2), "ti": ti,
             "tax": round(tax, 2), "rebate": round(rebate, 2),
             "surcharge": round(sc_net, 2), "cess": round(cess, 2),
@@ -16854,7 +17390,7 @@ def _regime_calc(inp, auto, fy, regime, R):
             "cgDetail": cgb["detail"]}
 
 
-def tax_compute(fy=None):
+def tax_compute(fy=None, _depth=0):
     """The year's computation: {ok, fy, filled, totalTax, regimes...}."""
     if not fy:
         try:
@@ -16864,6 +17400,23 @@ def tax_compute(fy=None):
             fy = acc_fy_of(datetime.date.today().isoformat())
     R = tax_rates(fy)
     inp = tax_input(fy)
+    R = _tax_over(R, inp.get("over"))
+    carried = {}
+    # 20.23: losses of the year before carried forward by themselves
+    prev = "%d-%02d" % ((_fy_year(fy) or 0) - 1, (_fy_year(fy) or 0) % 100)
+    if R and tax_input(prev).get("saved") and _depth < 1:
+        try:
+            pr = tax_compute(prev, _depth=1)
+            cf = (pr.get("res") or {}).get(pr.get("chosen") or "", {}).get("carry") or {}
+            bf = dict(inp.get("bf") or {})
+            for k, v in cf.items():
+                if bf.get(k) in (None, "") and v:
+                    bf[k] = round(v, 2)
+                    carried[k] = round(v, 2)
+            if carried:
+                inp = dict(inp, bf=bf)
+        except Exception:
+            carried = {}
     if not R:
         return {"ok": True, "fy": fy, "supported": False, "filled": False,
                 "inp": inp, "error": "The Taxes section works out FY 2025-26 "
@@ -16872,7 +17425,8 @@ def tax_compute(fy=None):
     auto = tax_auto(fy)
     ent = inp.get("entity") if inp.get("entity") in TAX_ENTITIES \
         else "individual"
-    if ent in ("individual", "huf", "aop"):
+    private_trust = ent == "trust" and (inp.get("trust") or {}).get("kind") == "private"
+    if ent in ("individual", "huf", "aop") or (ent == "trust" and not private_trust):
         res = {"new": _regime_calc(inp, auto, fy, "new", R),
                "old": _regime_calc(inp, auto, fy, "old", R)}
         best = "new" if res["new"]["total"] <= res["old"]["total"] else "old"
@@ -16884,6 +17438,10 @@ def tax_compute(fy=None):
     return {"ok": True, "fy": fy, "supported": True, "inp": inp,
             "auto": auto, "res": res, "best": best, "chosen": chosen,
             "filled": filled, "totalTax": res[chosen]["liability"],
+            "carried": carried, "prevFy": prev, "years": sorted(k for k in tax_load() if _fy_year(k)),
+            "overKeys": TAX_OVER_KEYS, "overridden": R.get("overridden") or [],
+            "rates": {k: R.get(k) for k in TAX_OVER_KEYS},
+            "ruleAlerts": [x for x in (tax_load().get("_ruleAlerts") or []) if x.get("fy") == fy and not x.get("done")],
             "marginal": res[chosen]["marginal"],
             "entities": TAX_ENTITIES, "cgTypes": TAX_CG_TYPES,
             "newAct": (_fy_year(fy) or 0) >= 2026,
@@ -17000,7 +17558,676 @@ def tax_api(data):
         return tax_ask(data.get("q"), fy)
     if act == "harvest":
         return tax_harvest(fy)
+    if act == "tell":
+        return tax_tell(fy, data.get("text"))
+    if act == "docfill":
+        return tax_docfill(fy, data)
+    if act == "ais":
+        return tax_ais(fy, data)
+    if act == "cgexport":
+        return tax_cg_export(fy)
+    if act == "rulecheck":
+        return dict(tax_rule_check(force=True), comp=tax_compute(fy))
+    if act == "ruleanswer":
+        tax_rule_answer(str(data.get("id") or ""), bool(data.get("yes")))
+        return tax_compute(fy)
+    if act == "over":
+        inp = tax_input(fy)
+        tax_save(fy, dict(inp, over=data.get("over") if isinstance(data.get("over"), dict) else {}))
+        return tax_compute(fy)
     return {"ok": False, "error": "Unknown action"}
+
+
+# ---- 20.23: Gemini helpers for the Taxes box -----------------------------------
+def _gem_json(parts, timeout=60):
+    raw, why = gemini_parts(parts, timeout=timeout)
+    if not raw:
+        return None, why or "Gemini did not answer"
+    m = re.search(r"[\[{].*[\]}]", raw, re.S)
+    try:
+        return json.loads(m.group(0)) if m else None, ""
+    except ValueError:
+        return None, "Gemini's answer could not be read"
+
+
+def _file_part(data):
+    """A document he chose (b64 + its type) as a part for Gemini; an Excel
+    sheet is turned into text first."""
+    b64 = str(data.get("data") or "")
+    mime = str(data.get("mime") or "application/octet-stream")
+    name = str(data.get("name") or "")
+    if name.lower().endswith((".xlsx", ".xlsm")):
+        try:
+            import zipfile
+            z = zipfile.ZipFile(io.BytesIO(base64.b64decode(b64)))
+            ss = z.read("xl/sharedStrings.xml").decode("utf-8", "replace") if \
+                "xl/sharedStrings.xml" in z.namelist() else ""
+            strs = re.findall(r"<t[^>]*>(.*?)</t>", ss, re.S)
+            txt = []
+            for n in sorted(x for x in z.namelist() if x.startswith("xl/worksheets/sheet")):
+                for row in re.findall(r"<row[^>]*>(.*?)</row>", z.read(n).decode("utf-8", "replace"), re.S):
+                    cells = []
+                    for t, v in re.findall(r'<c[^>]*?(?:t="(\w+)")?[^>]*>.*?<v>(.*?)</v>', row, re.S):
+                        cells.append(strs[int(v)] if t == "s" and v.isdigit() and int(v) < len(strs) else v)
+                    if cells:
+                        txt.append("\t".join(cells))
+            return {"text": "Spreadsheet %s:\n" % name + "\n".join(txt)[:120000]}
+        except Exception:
+            pass
+    if mime.startswith("text/") or name.lower().endswith((".csv", ".txt", ".json")):
+        try:
+            return {"text": base64.b64decode(b64).decode("utf-8", "replace")[:150000]}
+        except Exception:
+            pass
+    return {"inline_data": {"mime_type": mime, "data": b64}}
+
+
+def tax_tell(fy, text):
+    """'The LTCG rate is now 15%' -> his own figure for that rate, and redo."""
+    R = _tax_over(tax_rates(fy), tax_input(fy).get("over")) or {}
+    cur = {k: R.get(k) for k in TAX_OVER_KEYS}
+    j, err = _gem_json([{"text": (
+        "Indian income tax, financial year %s. These are the figures in use (rates as fractions, "
+        "slabs as [upper limit or null, rate]): %s. The user says: \"%s\". Return ONLY JSON "
+        "{\"changes\": [{\"key\": one of %s, \"value\": the new value in the same form}], "
+        "\"ask\": \"a question if it is unclear, else empty\"}." % (
+            fy, json.dumps(cur, default=str), str(text)[:500], list(TAX_OVER_KEYS)))}])
+    if not isinstance(j, dict):
+        return {"ok": False, "error": err or "Not understood"}
+    inp = tax_input(fy)
+    over = dict(inp.get("over") or {})
+    done = []
+    for c in j.get("changes") or []:
+        if isinstance(c, dict) and c.get("key") in TAX_OVER_KEYS:
+            over[c["key"]] = c.get("value")
+            done.append("%s: %s" % (TAX_OVER_KEYS[c["key"]], c.get("value")))
+    if not done:
+        return {"ok": False, "error": j.get("ask") or "No change was found in that."}
+    tax_save(fy, dict(inp, over=over))
+    return dict(tax_compute(fy), told=done)
+
+
+def tax_docfill(fy, data):
+    """A document (computation in Excel, a photo, last year's ITR, Form 16,
+    a capital-gains statement...) -> figures for the blanks of this year."""
+    menu = "\n".join("%s = %s" % (k, v) for k, v in TAX_FIELDS.items())
+    j, err = _gem_json([_file_part(data), {"text": (
+        "This is a tax document of an Indian taxpayer (financial year %s). Read the figures that "
+        "belong in these fields:\n%s\nReturn ONLY JSON {\"values\": {\"<field key>\": number}, "
+        "\"facts\": {\"entity\": individual|huf|firm|llp|company|opc|aop|trust or empty, "
+        "\"pan\": \"\", \"name\": \"\"}, \"note\": \"one line on what the document is\"}. "
+        "Leave out anything you are not sure of. Numbers in rupees, no commas." % (fy, menu))}])
+    if not isinstance(j, dict):
+        return {"ok": False, "error": err or "The document could not be read"}
+    inp = tax_input(fy)
+    filled, skipped = [], []
+    new = json.loads(json.dumps(inp))
+    for k, v in (j.get("values") or {}).items():
+        if k not in TAX_FIELDS:
+            continue
+        try:
+            v = float(str(v).replace(",", ""))
+        except ValueError:
+            continue
+        a, _sep, b = k.partition(".")
+        box = new.setdefault(a, {}) if b else new
+        key = b or a
+        if not isinstance(box, dict):
+            continue
+        if box.get(key) in (None, "", 0):
+            box[key] = v
+            filled.append([TAX_FIELDS[k], v])
+        else:
+            skipped.append([TAX_FIELDS[k], v, box.get(key)])
+    ent = (j.get("facts") or {}).get("entity")
+    if ent in TAX_ENTITIES and not new.get("entity"):
+        new["entity"] = ent
+    if filled:
+        tax_save(fy, new)
+    return dict(tax_compute(fy), filledFrom={"note": str(j.get("note") or "")[:200],
+                                            "filled": filled, "kept": skipped})
+
+
+def tax_ais(fy, data):
+    """AIS / Form 26AS beside the dashboard's own figures."""
+    j, err = _gem_json([_file_part(data), {"text": (
+        "This is an Indian Annual Information Statement (AIS), TIS or Form 26AS for financial "
+        "year %s. Return ONLY JSON {\"tds\": total TDS, \"tcs\": total TCS, \"advance\": "
+        "advance tax paid, \"self\": self-assessment tax paid, \"dividend\": total dividend, "
+        "\"interestSavings\": savings interest, \"interestDeposit\": interest on deposits, "
+        "\"interestOther\": other interest, \"salary\": gross salary, \"rent\": rent received, "
+        "\"saleShares\": total sale value of listed shares and equity funds, \"saleOther\": "
+        "sale of other securities / property, \"purchaseShares\": purchases of shares, "
+        "\"advList\": [{\"date\": \"YYYY-MM-DD\", \"amount\": n}] for advance tax challans}. "
+        "Numbers in rupees; 0 when absent." % fy)}], timeout=90)
+    if not isinstance(j, dict):
+        return {"ok": False, "error": err or "The statement could not be read"}
+    c = tax_compute(fy)
+    inp, auto = c.get("inp") or {}, c.get("auto") or {}
+    os_ = inp.get("os") or {}
+    pd = inp.get("paid") or {}
+    sale = 0.0
+    try:
+        _a, v = acc_view(None)
+        sale = sum(float(r.get("sale") or 0) for r in ((v or {}).get("cg") or {}).get("rows") or [])
+    except Exception:
+        sale = 0.0
+    mine = {"tds": _tn(pd.get("tds")), "tcs": _tn(pd.get("tcs")),
+            "advance": _tn(pd.get("advance")), "self": _tn(pd.get("self")),
+            "dividend": _tn(os_.get("dividend")) or auto.get("dividend", 0.0),
+            "interestSavings": _tn(os_.get("savings")),
+            "interestDeposit": _tn(os_.get("fd")) + auto.get("pfInterest", 0.0),
+            "interestOther": _tn(os_.get("otherInt")) + auto.get("interest", 0.0),
+            "salary": _tn((inp.get("salary") or {}).get("gross")),
+            "saleShares": round(sale, 2)}
+    path = {"tds": "paid.tds", "tcs": "paid.tcs", "advance": "paid.advance", "self": "paid.self",
+            "dividend": "os.dividend", "interestSavings": "os.savings", "interestDeposit": "os.fd",
+            "interestOther": "os.otherInt", "salary": "salary.gross"}
+    names = {"tds": "TDS", "tcs": "TCS", "advance": "Advance tax", "self": "Self-assessment tax",
+             "dividend": "Dividends", "interestSavings": "Savings interest",
+             "interestDeposit": "Interest on deposits", "interestOther": "Other interest",
+             "salary": "Salary", "saleShares": "Sale value of shares (Accounts)"}
+    rows = []
+    for k, nm in names.items():
+        a = _tn(j.get(k))
+        b = round(mine.get(k, 0.0), 2)
+        if a or b:
+            rows.append({"key": k, "name": nm, "ais": round(a, 2), "mine": b,
+                         "diff": round(a - b, 2), "path": path.get(k)})
+    return {"ok": True, "rows": rows, "advList": j.get("advList") or [],
+            "extra": {k: j.get(k) for k in ("rent", "saleOther", "purchaseShares") if _tn(j.get(k))}}
+
+
+def tax_cg_export(fy):
+    """The year's share sales in the layout of the ITR's Schedule 112A (and
+    the 111A totals by the ITR's date blocks), as CSV for Excel."""
+    try:
+        _a, v = acc_view(None if fy == (acc_load() or {}).get("fy") else fy)
+    except Exception:
+        v = None
+    rows = ((v or {}).get("cg") or {}).get("rows") or []
+    isin = {}
+    try:
+        with open(os.path.join(DATA_DIR, "nse_shares.csv"), encoding="utf-8", errors="replace") as f:
+            for r in csv.reader(f):
+                if len(r) > 6:
+                    isin[r[0].strip().upper()] = r[6].strip()
+    except OSError:
+        pass
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["SCHEDULE 112A - long-term gains on listed equity shares (STT paid)", "FY " + fy])
+    w.writerow(["Acquired on or before 31 Jan 2018?", "ISIN", "Name of the share", "No. of shares",
+                "Sale price per share", "Full value of consideration", "Cost of acquisition without indexation",
+                "Cost of acquisition (s.55(2)(ac))", "FMV per share on 31 Jan 2018", "Total FMV on 31 Jan 2018",
+                "Expenditure on transfer", "Total deductions", "Balance (gain)", "Date sold", "Date bought"])
+    for r in rows:
+        if r.get("tax") != "LTCG":
+            continue
+        q = float(r.get("q") or 0)
+        sale, cost, chg = float(r.get("sale") or 0), float(r.get("cost") or 0), float(r.get("chg") or 0)
+        pre = str(r.get("buy") or "") < "2018-02-01"
+        w.writerow(["Yes" if pre else "No", isin.get(str(r.get("sym") or "").upper(), ""), r.get("sym"), q,
+                    round(sale / q, 2) if q else "", round(sale, 2), round(cost, 2), round(cost, 2),
+                    "" if not pre else "(type it)", "", round(chg, 2), round(cost + chg, 2),
+                    round(sale - cost - chg, 2), r.get("d"), r.get("buy")])
+    w.writerow([])
+    y = _fy_year(fy) or 0
+    blocks = [("Up to 15 Jun", "%d-06-15" % y), ("16 Jun - 15 Sep", "%d-09-15" % y),
+              ("16 Sep - 15 Dec", "%d-12-15" % y), ("16 Dec - 15 Mar", "%d-03-15" % (y + 1)),
+              ("16 Mar - 31 Mar", "%d-03-31" % (y + 1))]
+    w.writerow(["Gains by the ITR's date blocks (Schedule CG, accrual / receipt)"])
+    w.writerow(["Type"] + [b[0] for b in blocks] + ["Total"])
+    for typ in ("STCG", "LTCG"):
+        vals, lo = [], ""
+        for _n, hi in blocks:
+            vals.append(round(sum(float(r.get("taxable") if r.get("taxable") is not None else r.get("np") or 0)
+                                  for r in rows if r.get("tax") == typ and lo < str(r.get("d") or "") <= hi), 2))
+            lo = hi
+        w.writerow([{"STCG": "111A short-term (20%)", "LTCG": "112A long-term (12.5%)"}[typ]] + vals + [round(sum(vals), 2)])
+    return {"ok": True, "name": "Capital gains %s (ITR layout).csv" % fy, "csv": out.getvalue()}
+
+
+TAXRULE = {"running": False}
+
+
+def tax_rule_check(force=False):
+    """Once a month (2nd or 3rd) or on his button: have rates, slabs or
+    amounts been changed by law? Each change found waits for his yes."""
+    d = tax_load()
+    month = time.strftime("%Y-%m")
+    if not force and d.get("_ruleMonth") == month:
+        return {"ok": True, "skipped": True}
+    if TAXRULE["running"]:
+        return {"ok": False, "error": "Already checking"}
+    TAXRULE["running"] = True
+    try:
+        fy = acc_fy_of(datetime.date.today().isoformat())
+        R = _tax_over(tax_rates(fy), tax_input(fy).get("over")) or {}
+        cur = {k: R.get(k) for k in TAX_OVER_KEYS}
+        heads = []
+        try:
+            heads = [c.get("title") for c in _rule_news() if re.search(
+                r"income.?tax|slab|capital gain|finance (bill|act)|standard deduction|rebate|cbdt|ltcg|stcg",
+                str(c.get("title") or ""), re.I)][:40]
+        except Exception:
+            heads = []
+        j, err = _gem_json([{"text": (
+            "Indian income tax for financial year %s. The dashboard uses: %s (rates as fractions; slabs "
+            "[upper limit or null, rate]). Recent headlines: %s. Has any of these figures been CHANGED BY "
+            "LAW - enacted in a Finance Act or notified - for this year (proposals and budget speeches "
+            "do not count)? Return ONLY JSON {\"changes\": [{\"key\": one of %s, \"value\": new value in "
+            "the same form, \"why\": \"the law and date\"}]} - an empty list when nothing changed or you "
+            "are not sure." % (fy, json.dumps(cur, default=str), json.dumps(heads), list(TAX_OVER_KEYS)))}])
+        if j is None:
+            return {"ok": False, "error": err}
+        d = tax_load()
+        alerts = d.get("_ruleAlerts") or []
+        added = []
+        for c in (j.get("changes") or []) if isinstance(j, dict) else []:
+            if isinstance(c, dict) and c.get("key") in TAX_OVER_KEYS and \
+                    json.dumps(c.get("value")) != json.dumps(cur.get(c["key"]), default=str):
+                a = {"id": secrets.token_hex(4), "fy": fy, "key": c["key"], "name": TAX_OVER_KEYS[c["key"]],
+                     "value": c.get("value"), "was": cur.get(c["key"]), "why": str(c.get("why") or "")[:300],
+                     "at": time.strftime("%d %b %Y")}
+                alerts.append(a)
+                added.append(a)
+        d["_ruleAlerts"] = alerts[-40:]
+        d["_ruleMonth"] = month
+        d["_ruleAt"] = time.strftime("%d %b %Y %H:%M")
+        with TAX_LOCK:
+            _write_json(tax_path(), d)
+        return {"ok": True, "found": added, "at": d["_ruleAt"]}
+    finally:
+        TAXRULE["running"] = False
+
+
+def tax_rule_answer(aid, yes):
+    d = tax_load()
+    for a in d.get("_ruleAlerts") or []:
+        if a.get("id") == aid and not a.get("done"):
+            a["done"] = "applied" if yes else "ignored"
+            with TAX_LOCK:
+                _write_json(tax_path(), d)
+            if yes:
+                inp = tax_input(a["fy"])
+                over = dict(inp.get("over") or {})
+                over[a["key"]] = a["value"]
+                tax_save(a["fy"], dict(inp, over=over))
+            return {"ok": True}
+    return {"ok": False, "error": "Not found"}
+
+
+def tax_rule_loop():
+    time.sleep(300)
+    while STATS["running"]:
+        try:
+            if datetime.date.today().day in (2, 3):
+                tax_rule_check()
+        except Exception:
+            pass
+        for _ in range(3600):
+            if not STATS["running"]:
+                break
+            time.sleep(1)
+
+
+# ---- 20.23: the screener and backtesting ------------------------------------------
+SCREEN_INDIA = ["NIFTY 50", "NIFTY NEXT 50", "NIFTY 100", "NIFTY 200", "NIFTY 500",
+                "NIFTY MIDCAP 50", "NIFTY MIDCAP 100", "NIFTY MIDCAP 150", "NIFTY SMLCAP 50",
+                "NIFTY SMLCAP 100", "NIFTY SMLCAP 250", "NIFTY MIDSML 400", "NIFTY BANK",
+                "NIFTY FIN SERVICE", "NIFTY PVT BANK", "NIFTY PSU BANK", "NIFTY IT", "NIFTY AUTO",
+                "NIFTY PHARMA", "NIFTY HEALTHCARE", "NIFTY FMCG", "NIFTY METAL", "NIFTY REALTY",
+                "NIFTY ENERGY", "NIFTY OIL & GAS", "NIFTY MEDIA", "NIFTY INFRA", "NIFTY CONSUMPTION",
+                "NIFTY CPSE", "NIFTY PSE", "NIFTY COMMODITIES", "NIFTY INDIA DEFENCE",
+                "NIFTY CAPITAL MKT", "NIFTY CONSR DURBL"]
+# Wikipedia keeps the S&P 500's members in a table (the Dow's and the
+# Nasdaq-100's pages no longer do - checked 7 Nov 2026); the S&P 500
+# holds nearly all of them anyway
+SCREEN_FOREIGN = {"S&P 500 (US)": ("List_of_S%26P_500_companies", "Symbol")}
+SCREEN_CACHE = {}
+
+
+def _wiki_members(page, col):
+    """The members of a foreign index from Wikipedia's table (kept a week)."""
+    f = os.path.join(DATA_DIR, "screener_lists.json")
+    d = _read_json(f, {})
+    hit = d.get(page)
+    if hit and time.time() - hit.get("at", 0) < 7 * 86400:
+        return hit["syms"]
+    raw = urllib.request.urlopen(urllib.request.Request(
+        "https://en.wikipedia.org/wiki/" + page, headers={"User-Agent": UA}), timeout=20).read().decode("utf-8", "replace")
+    syms = []
+    for tbl in re.findall(r'<table[^>]*(?:wikitable|sortable|constituents)[^>]*>(.*?)</table>', raw, re.S):
+        heads = [re.sub(r"\[[^\]]*\]", "", re.sub(r"<[^>]+>", "", h)).strip().lower()
+                 for h in re.findall(r"<th[^>]*>(.*?)</th>", tbl.split("</tr>")[0], re.S)]
+        k = next((i for i, h in enumerate(heads) if h in (col.lower(), "ticker", "symbol", "ticker symbol")), None)
+        if k is None:
+            continue
+        for row in tbl.split("</tr>")[1:]:
+            cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.S)
+            if len(cells) > k:
+                s = html_lib.unescape(re.sub(r"<[^>]+>", "", cells[k])).strip().upper()
+                if re.match(r"^[A-Z.\-]{1,6}$", s):
+                    syms.append(s)
+        if len(syms) > 20:
+            break
+    syms = list(dict.fromkeys(syms))
+    if syms:
+        d[page] = {"at": time.time(), "syms": syms}
+        _write_json(f, d)
+    return syms
+
+
+def screener(universe):
+    """Every member of an index with its figures, fresh (a minute)."""
+    hit = SCREEN_CACHE.get(universe)
+    if hit and time.time() - hit["at"] < 60:
+        return hit["d"]
+    rows, err = [], ""
+    beta = _read_json(os.path.join(DATA_DIR, "beta.json"), {}) or {}
+    with CACHE_LOCK:
+        quotes = {k: v for k, v in CACHE.items() if isinstance(v, dict)}
+    wl = set(load_state().get("watchlist") or [])
+    if universe in SCREEN_INDIA:
+        d, e = SESSION.fetch(MW + Q(universe), "https://www.nseindia.com/market-data/live-market-indices")
+        lst = d.get("data") if isinstance(d, dict) else None
+        if isinstance(lst, dict):
+            lst = lst.get("data")
+        for r in lst or []:
+            sym = str(r.get("symbol") or "").upper()
+            if not sym or sym.startswith("NIFTY") or sym == universe:
+                continue
+            q = quotes.get(sym) or {}
+            b = beta.get(sym)
+            rows.append({"sym": sym, "name": str(r.get("companyName") or "").title(),
+                         "ltp": to_number(r.get("lastPrice")), "pct": to_number(r.get("pChange")),
+                         "pct30": to_number(r.get("perChange30d")), "pct365": to_number(r.get("perChange365d")),
+                         "hi52": to_number(r.get("yearHigh")), "lo52": to_number(r.get("yearLow")),
+                         "fromHi": _pct_from(r.get("lastPrice"), r.get("yearHigh")),
+                         "fromLo": _pct_from(r.get("lastPrice"), r.get("yearLow")),
+                         "value": to_number(r.get("totalTradedValue")),
+                         "mcap": to_number(r.get("ffmc")), "pe": q.get("pe"), "sectorPe": q.get("sectorPe"),
+                         "beta": (b.get("beta") if isinstance(b, dict) else b) if b is not None else None,
+                         "mine": sym in wl, "at": r.get("lastUpdateTime")})
+        if not rows:
+            err = "NSE sent no members for %s just now (%s)" % (universe, e or "empty")
+    elif universe in SCREEN_FOREIGN:
+        try:
+            syms = _wiki_members(*SCREEN_FOREIGN[universe])
+        except Exception as e:
+            syms, err = [], "The list of members could not be read (%s)" % str(e)[:60]
+        for i in range(0, len(syms), 40):
+            part = syms[i:i + 40]
+            try:
+                url = ("https://quote.cnbc.com/quote-html-webservice/quote.htm?symbols=" +
+                       urllib.parse.quote("|".join(part), safe="|") +
+                       "&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json")
+                dd = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    url, headers={"User-Agent": UA}), timeout=15).read().decode("utf-8", "replace"))
+                got = ((dd.get("ITVQuoteResult") or {}).get("ITVQuote")) or []
+                got = [got] if isinstance(got, dict) else got
+            except Exception:
+                got = []
+            for r in got:
+                last = _n(r.get("last"))
+                if last is None:
+                    continue
+                hi, lo = _n(r.get("yrhiprice")), _n(r.get("yrloprice"))
+                rows.append({"sym": r.get("symbol"), "name": r.get("name") or r.get("shortName") or "",
+                             "ltp": last, "pct": _n(r.get("change_pct")), "pct30": None, "pct365": None,
+                             "hi52": hi, "lo52": lo,
+                             "fromHi": round((last / hi - 1) * 100, 2) if hi else None,
+                             "fromLo": round((last / lo - 1) * 100, 2) if lo else None,
+                             "value": None, "mcap": _n(r.get("mktcapView") or r.get("mktcap")),
+                             "pe": _n(r.get("pe")), "sectorPe": None, "beta": _n(r.get("beta")),
+                             "mine": False, "at": r.get("last_time")})
+        if not rows and not err:
+            err = "No prices came for %s just now" % universe
+    else:
+        return {"ok": False, "error": "Unknown index"}
+    out = {"ok": True, "universe": universe, "rows": rows, "error": err,
+           "at": time.strftime("%d %b %Y %H:%M:%S")}
+    if rows:
+        SCREEN_CACHE[universe] = {"at": time.time(), "d": out}
+    return out
+
+
+def _pct_from(a, b):
+    a, b = to_number(a), to_number(b)
+    return round((a / b - 1) * 100, 2) if a and b else None
+
+
+def _sma(v, n, i):
+    return sum(v[i - n + 1:i + 1]) / n if i >= n - 1 else None
+
+
+def _rsi_series(v, n=14):
+    out = [None] * len(v)
+    if len(v) <= n:
+        return out
+    g = [max(0.0, v[i] - v[i - 1]) for i in range(1, len(v))]
+    l_ = [max(0.0, v[i - 1] - v[i]) for i in range(1, len(v))]
+    ag, al = sum(g[:n]) / n, sum(l_[:n]) / n
+    for i in range(n, len(v)):
+        if i > n:
+            ag = (ag * (n - 1) + g[i - 1]) / n
+            al = (al * (n - 1) + l_[i - 1]) / n
+        out[i] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out
+
+
+def backtest(p):
+    """One rule tested on up to ten years of daily closes of one share or
+    index: every trade, the results, and buying-and-holding beside it."""
+    sym = str(p.get("sym") or "").strip().upper()
+    years = max(1, min(10, int(_n(p.get("years")) or 5)))
+    if not sym:
+        return {"ok": False, "error": "Which share?"}
+    data, _fresh = daily_closes(sym)
+    if not data or len(data) < 60:
+        return {"ok": False, "error": "Not enough history for %s could be fetched." % sym}
+    cut = (datetime.date.today() - datetime.timedelta(days=365 * years)).isoformat()
+    data = [(d, c) for d, c in data if str(d) >= cut and c]
+    days = [str(d) for d, _c in data]
+    v = [float(c) for _d, c in data]
+    ent, ex = p.get("entry") or {}, p.get("exit") or {}
+    try:
+        cost = float(p.get("cost")) / 100.0 if p.get("cost") not in (None, "") else 0.0025
+    except (TypeError, ValueError):
+        cost = 0.0025
+    rsi = _rsi_series(v, int(_n(ent.get("n")) or _n(ex.get("n")) or 14))
+
+    def hi(n, i):
+        return max(v[i - n:i]) if i >= n else None
+
+    def lo(n, i):
+        return min(v[i - n:i]) if i >= n else None
+
+    def entry_ok(i):
+        k, n, x = ent.get("kind"), int(_n(ent.get("n")) or 20), _n(ent.get("x")) or 0
+        if k == "smaUp":
+            a, b = _sma(v, n, i), _sma(v, n, i - 1)
+            return a is not None and b is not None and v[i - 1] <= b and v[i] > a
+        if k == "smaCross":
+            m = int(_n(ent.get("m")) or 50)
+            a1, b1, a0, b0 = _sma(v, n, i), _sma(v, m, i), _sma(v, n, i - 1), _sma(v, m, i - 1)
+            return None not in (a1, b1, a0, b0) and a0 <= b0 and a1 > b1
+        if k == "rsiBelow":
+            return rsi[i] is not None and rsi[i] < (x or 30)
+        if k == "breakout":
+            h = hi(n, i)
+            return h is not None and v[i] > h
+        if k == "dip":
+            h = hi(n, i)
+            return h is not None and v[i] <= h * (1 - (x or 10) / 100.0)
+        if k == "fallDays":
+            return i >= n and all(v[j] < v[j - 1] for j in range(i - n + 1, i + 1))
+        return False
+
+    def exit_ok(i, entry_px, held):
+        k, n, x = ex.get("kind"), int(_n(ex.get("n")) or 20), _n(ex.get("x")) or 0
+        tgt, stp = _n(ex.get("target")), _n(ex.get("stop"))
+        if tgt and v[i] >= entry_px * (1 + tgt / 100.0):
+            return "target"
+        if stp and v[i] <= entry_px * (1 - stp / 100.0):
+            return "stop"
+        if k == "smaDown":
+            a = _sma(v, n, i)
+            return "below SMA" if a is not None and v[i] < a else ""
+        if k == "rsiAbove":
+            return "RSI" if rsi[i] is not None and rsi[i] > (x or 70) else ""
+        if k == "days":
+            return "%d days" % n if held >= n else ""
+        if k == "breakdown":
+            lw = lo(n, i)
+            return "low broken" if lw is not None and v[i] < lw else ""
+        return ""
+
+    trades, pos, eq, peak, mdd, curve = [], None, 1.0, 1.0, 0.0, []
+    for i in range(1, len(v)):
+        if pos is None and entry_ok(i):
+            pos = {"i": i, "px": v[i]}
+        elif pos is not None:
+            why = exit_ok(i, pos["px"], i - pos["i"])
+            if why or i == len(v) - 1:
+                r = v[i] / pos["px"] - 1 - cost
+                eq *= 1 + r
+                trades.append({"in": days[pos["i"]], "out": days[i], "pxIn": round(pos["px"], 2),
+                               "pxOut": round(v[i], 2), "ret": round(r * 100, 2), "days": i - pos["i"],
+                               "why": why or "still open"})
+                pos = None
+        mark = eq * (v[i] / pos["px"] if pos else 1)
+        peak = max(peak, mark)
+        mdd = max(mdd, 1 - mark / peak)
+        if i % max(1, len(v) // 300) == 0:
+            curve.append([days[i], round(mark, 4), round(v[i] / v[0], 4)])
+    n_ = len(trades)
+    wins = [t for t in trades if t["ret"] > 0]
+    yrs = max(0.1, len(v) / 250.0)
+    return {"ok": True, "sym": sym, "from": days[0], "to": days[-1], "bars": len(v),
+            "trades": trades[-300:], "count": n_, "winRate": round(len(wins) / n_ * 100, 1) if n_ else None,
+            "total": round((eq - 1) * 100, 2), "cagr": round((eq ** (1 / yrs) - 1) * 100, 2),
+            "hold": round((v[-1] / v[0] - 1) * 100, 2),
+            "holdCagr": round(((v[-1] / v[0]) ** (1 / yrs) - 1) * 100, 2),
+            "maxDD": round(mdd * 100, 2), "avgWin": round(sum(t["ret"] for t in wins) / len(wins), 2) if wins else None,
+            "avgLoss": round(sum(t["ret"] for t in trades if t["ret"] <= 0) / max(1, n_ - len(wins)), 2) if n_ > len(wins) else None,
+            "curve": curve, "cost": cost * 100}
+
+
+# ---- 20.23: calls made on TV (Zee Business, CNBC-TV18 / Awaaz, ET Now...) -------
+TVCALL_FILE = os.path.join(DATA_DIR, "tv_calls.json")
+TVCALL = {"running": False, "error": "", "at": ""}
+TV_WORDS = re.compile(r"\b(buy|sell|target|stop ?loss|stocks? to (buy|watch)|top picks?|recommend\w*|trading ideas?|"
+                      r"technical picks?|short ?term picks?)\b", re.I)
+TV_SOURCE = re.compile(r"(zee ?biz|zee business|cnbc|awaaz|et ?now|ndtv ?profit|bq prime|anil singhvi|"
+                       r"market guru|moneycontrol)", re.I)
+
+
+def _nse_symbol_set():
+    out = set()
+    try:
+        with open(os.path.join(DATA_DIR, "nse_shares.csv"), encoding="utf-8", errors="replace") as f:
+            for r in csv.reader(f):
+                if r:
+                    out.add(r[0].strip().upper())
+    except OSError:
+        pass
+    return out
+
+
+def tv_calls_scan():
+    if TVCALL["running"]:
+        return
+    if not GEMINI["key"]:
+        TVCALL["error"] = "This needs Gemini (Ask panel -> key)."
+        return
+    TVCALL["running"] = True
+    try:
+        items = list(NEWS.get("globalAll") or []) + list(NEWS.get("items") or [])
+        d = _read_json(TVCALL_FILE, {"calls": [], "seen": []})
+        seen = set(d.get("seen") or [])
+        cands = []
+        for x in items:
+            t = str(x.get("title") or "")
+            k = re.sub(r"[^a-z0-9]", "", t.lower())[:90]
+            if not t or k in seen or not TV_WORDS.search(t):
+                continue
+            if not (TV_SOURCE.search(t + " " + str(x.get("source") or "") + " " + str(x.get("link") or "")) or
+                    re.search(r"stocks? to buy|picks?|target", t, re.I)):
+                continue
+            seen.add(k)
+            cands.append(x)
+        cands = cands[:30]
+        TVCALL["at"] = time.strftime("%H:%M")
+        if not cands:
+            return
+        lines = "\n".join("%d. %s | %s | %s" % (i, c.get("title"), c.get("source") or "",
+                                                 str(c.get("desc") or "")[:400]) for i, c in enumerate(cands))
+        j, err = _gem_json([{"text": (
+            "These Indian market news items may report calls made by analysts on TV channels (Zee Business, "
+            "CNBC-TV18, CNBC Awaaz, ET Now, NDTV Profit...) or in market columns. List ONLY the calls that are "
+            "stated in them - never guess. Return ONLY a JSON list [{\"i\": item number, \"sym\": NSE symbol, "
+            "\"name\": company, \"call\": \"BUY\" or \"SELL\", \"price\": entry or current price if stated "
+            "else null, \"target\": number or null, \"stop\": number or null, \"analyst\": name or \"\", "
+            "\"channel\": TV channel or publication, \"horizon\": \"intraday\" / \"short term\" / "
+            "\"long term\" / \"\"}]. An empty list when none.\n" + lines)}], timeout=60)
+        if j is None:
+            TVCALL["error"] = err or ""
+            return
+        syms = _nse_symbol_set()
+        now = time.time()
+        calls = [c for c in d.get("calls") or [] if now - c.get("ts", 0) < 7 * 86400]
+        for c in j if isinstance(j, list) else []:
+            try:
+                src = cands[int(c.get("i"))]
+            except (TypeError, ValueError, IndexError):
+                continue
+            sym = str(c.get("sym") or "").strip().upper()
+            if sym not in syms or str(c.get("call") or "").upper() not in ("BUY", "SELL"):
+                continue
+            cid = hashlib.sha1((sym + str(src.get("title"))).encode()).hexdigest()[:10]
+            if any(x["id"] == cid for x in calls):
+                continue
+            calls.append({"id": cid, "ts": now, "at": time.strftime("%d %b %H:%M"), "sym": sym,
+                          "name": str(c.get("name") or "")[:60], "call": str(c["call"]).upper(),
+                          "price": _n(c.get("price")), "target": _n(c.get("target")), "stop": _n(c.get("stop")),
+                          "analyst": str(c.get("analyst") or "")[:60], "channel": str(c.get("channel") or "")[:40],
+                          "horizon": str(c.get("horizon") or "")[:20], "title": str(src.get("title"))[:200],
+                          "link": src.get("link") or ""})
+        d["calls"], d["seen"] = calls[-300:], list(seen)[-3000:]
+        _write_json(TVCALL_FILE, d)
+        TVCALL["error"] = ""
+    finally:
+        TVCALL["running"] = False
+
+
+def tv_calls_loop():
+    time.sleep(120)
+    while STATS["running"]:
+        try:
+            n = datetime.datetime.now()
+            if n.weekday() < 5 and 8 <= n.hour < 17:
+                tv_calls_scan()
+        except Exception:
+            pass
+        for _ in range(900):
+            if not STATS["running"]:
+                break
+            time.sleep(1)
+
+
+def tv_calls_view():
+    d = _read_json(TVCALL_FILE, {"calls": []})
+    now = time.time()
+    with CACHE_LOCK:
+        live = {k: (v.get("ltp") if isinstance(v, dict) else None) for k, v in CACHE.items()}
+    out = []
+    for c in d.get("calls") or []:
+        if now - c.get("ts", 0) < 7 * 86400:
+            out.append(dict(c, ltp=live.get(c["sym"])))
+    out.sort(key=lambda c: -c.get("ts", 0))
+    return {"ok": True, "calls": out, "at": TVCALL["at"], "error": TVCALL["error"]}
 
 
 def tax_harvest(fy=None):
@@ -17414,6 +18641,233 @@ def tm_results_days(sym):
             except ValueError:
                 continue
     return days
+
+
+def daily_closes(sym):
+    """20.20: [(day, close)] - ten years from the chart's source, with the
+    last year taken from NSE's own file (the chart's source can be a day
+    behind, and a missing day must never pass for the latest)."""
+    try:
+        bars, _ev = _tm_bars(_tm_ysym(sym, "share"))
+    except Exception:
+        bars = []
+    mp = {_day(b[0]): b[4] for b in bars if b[4]}
+    try:
+        nse = share_daily(sym)
+    except Exception:
+        nse = {}
+    if nse:
+        cut = min(nse)
+        mp = {k: v for k, v in mp.items() if k < cut}
+        mp.update({k: v for k, v in nse.items() if v})
+    out = sorted(mp.items())
+    fresh = bool(nse) and bool(out) and out[-1][0] >= prior_trading_day(
+        datetime.date.today()).isoformat()
+    return out, fresh
+
+
+RESMOVE_CACHE = {}
+
+
+def results_moves(sym):
+    """20.20: the share's move on its last 8 results days - the day of the
+    board meeting and the day after, from the close before it."""
+    sym = re.sub(r"[^A-Z0-9&_-]", "", str(sym or "").upper())[:20]
+    if not sym:
+        return {"ok": False, "error": "No share named."}
+    hit = RESMOVE_CACHE.get(sym)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        return hit[1]
+    days = sorted(d for d in tm_results_days(sym)
+                  if d <= datetime.date.today().isoformat())
+    if not days:
+        return {"ok": False, "error": "could not fetch the latest (NSE gave "
+                "no results days for %s)" % sym}
+    ser, _fresh = daily_closes(sym)
+    if len(ser) < 30:
+        return {"ok": False, "error": "could not fetch the latest (no price "
+                "history for %s)" % sym}
+    dd = [x[0] for x in ser]
+    cl = [x[1] for x in ser]
+    rows = []
+    for day in reversed(days):
+        i = next((k for k, x in enumerate(dd) if x >= day), None)
+        if i is None or i < 1 or dd[i] > day and i < len(dd) and \
+                (datetime.date.fromisoformat(dd[i]) -
+                 datetime.date.fromisoformat(day)).days > 5:
+            continue
+        p0 = cl[i - 1]
+        d0 = (cl[i] / p0 - 1) * 100 if p0 else None
+        d1 = (cl[i + 1] / cl[i] - 1) * 100 if i + 1 < len(cl) and cl[i] \
+            else None
+        tot = (cl[i + 1] / p0 - 1) * 100 if i + 1 < len(cl) and p0 else d0
+        rows.append({"date": day, "d0": d0, "d1": d1, "tot": tot})
+        if len(rows) == 8:
+            break
+    if not rows:
+        return {"ok": False, "error": "could not fetch the latest (no prices "
+                "on %s's results days)" % sym}
+    tots = [r["tot"] for r in rows if r["tot"] is not None]
+    out = {"ok": True, "sym": sym, "rows": rows,
+           "ups": sum(1 for t in tots if t > 0),
+           "avgAbs": sum(abs(t) for t in tots) / len(tots) if tots else 0.0}
+    RESMOVE_CACHE[sym] = (time.time(), out)
+    return out
+
+
+# ---- 20.20: shares entering / leaving a Nifty index (NSE Indices' own
+# press releases, read from their PDFs) ----
+IXCHG = {"list": (0, []), "pdf": {}, "lock": threading.Lock()}
+NI_BASE = "https://www.niftyindices.com"
+
+
+def _ixnorm(s):
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def ix_releases():
+    """[(date iso, title, pdf url)] from niftyindices.com/press-release,
+    kept 6 hours."""
+    at, lst = IXCHG["list"]
+    if lst and time.time() - at < 6 * 3600:
+        return lst
+    try:
+        req = urllib.request.Request(NI_BASE + "/press-release",
+                                     headers={"User-Agent": UA})
+        s = urllib.request.urlopen(req, timeout=25).read().decode(
+            "utf-8", "replace")
+    except Exception:
+        return lst
+    out = []
+    for d, h, t in re.findall(r'data-date="([^"]+)"[^>]*>\s*<p>[^<]*</p>'
+                              r"\s*<a href='([^']+)'[^>]*>([^<]+)</a>", s):
+        try:
+            iso = datetime.datetime.strptime(d.strip(), "%b %d, %Y").date() \
+                .isoformat()
+        except ValueError:
+            continue
+        out.append((iso, html_lib.unescape(t.strip()), urllib.parse.urljoin(
+            NI_BASE, h)))
+    if out:
+        IXCHG["list"] = (time.time(), out)
+    return out
+
+
+def ix_pdf_changes(url):
+    """One release -> {"eff": date text, "rows": [(index, in|out, symbol,
+    company)]}. A row is kept only under an index heading read in the PDF -
+    never guessed."""
+    hit = IXCHG["pdf"].get(url)
+    if hit is not None:
+        return hit
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        raw = urllib.request.urlopen(req, timeout=30).read()
+        lines = pdf_lines(raw)
+    except Exception:
+        return None
+    out, ix, mode, eff = [], None, None, ""
+    for ln in lines:
+        cells = [c[1].strip() for c in ln[2] if c[1].strip()]
+        if not cells:
+            continue
+        text = " ".join(cells)
+        m = re.search(r"effective from\s+([A-Za-z]+\s*\d{1,2},?\s*\d{4})",
+                      text)
+        if m and not eff:
+            eff = m.group(1)
+        if len(cells) >= 2 and re.fullmatch(r"\d{1,2}\)", cells[0]) and \
+                re.search(r"nifty|index", cells[1], re.I):
+            ix, mode = cells[1], None
+            continue
+        if re.fullmatch(r"(?:[A-Z]\)\s*)?Nifty[\w &-]{1,40}:?", text) and \
+                len(cells) <= 2 and "replacement" not in text.lower():
+            ix, mode = text.split(")")[-1].strip(" :"), None
+            continue
+        low = text.lower().replace(" ", "")
+        if "beingexcluded" in low:
+            mode = "out"
+            continue
+        if "beingincluded" in low:
+            mode = "in"
+            continue
+        if low.startswith("noinclusion") or low.startswith("noexclusion") \
+                or low.startswith("nochange"):
+            mode = None
+            continue
+        if ix and mode and len(cells) >= 3 and re.fullmatch(r"\d{1,3}",
+                                                            cells[0]) and \
+                re.fullmatch(r"[A-Z0-9&_-]{1,20}", cells[-1]):
+            out.append((ix, mode, cells[-1], " ".join(cells[1:-1])[:60]))
+    iso = ""
+    m = re.match(r"([A-Za-z]+)\s*(\d{1,2}),?\s*(\d{4})", eff)
+    if m:
+        for f in ("%B %d %Y", "%b %d %Y"):
+            try:
+                iso = datetime.datetime.strptime(" ".join(m.groups()), f) \
+                    .date().isoformat()
+                break
+            except ValueError:
+                continue
+    res = {"eff": iso, "rows": out}
+    IXCHG["pdf"][url] = res
+    return res
+
+
+def index_changes(name):
+    """Shares that entered / are leaving one Nifty index in the last six
+    months, and other releases about that index. Exact index name only -
+    Nifty 50 never takes Nifty 500's or Nifty50 Shariah's changes."""
+    want = _ixnorm(name)
+    if want == "nifty":
+        want = "nifty50"
+    if not want.startswith("nifty"):
+        return {"ok": False, "error": "Index changes are read for the Nifty "
+                "indices only (from NSE Indices); %s is not one." % name}
+    rel = ix_releases()
+    if not rel:
+        return {"ok": False, "error": "could not fetch the latest "
+                "(niftyindices.com did not answer)"}
+    since = (datetime.date.today() - datetime.timedelta(days=183)).isoformat()
+    tre = re.compile(r"nifty\s*" + re.escape(want[5:]) +
+                     r"(?=\s*(?:index\b|indices\b|$|[,.;:)]))", re.I) \
+        if want[5:] else None
+    # a release naming one other index (Nifty IPO, SME Emerge...) is not
+    # read; the general ones ("Replacements in indices") and those naming
+    # this index are
+    cand = [r for r in rel if r[0] >= since and re.search(
+        r"replacement|inclusion|exclusion|changes? in|reconstitution",
+        r[1], re.I) and not re.search(r"fixed income|g-sec|bond|sdl|t-bill",
+                                     r[1], re.I) and (
+        re.search(r"\bindices\b", r[1], re.I) or (tre and tre.search(r[1])))]
+    res = {}
+    ths = [threading.Thread(target=lambda u=u: res.__setitem__(
+        u, ix_pdf_changes(u)), daemon=True) for _d, _t, u in cand[:40]]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(40)
+    moves, other, failed = [], [], 0
+    for d, t, u in rel:
+        if d < since:
+            continue
+        p = res.get(u) if any(u == c[2] for c in cand[:40]) else None
+        if any(u == c[2] for c in cand[:40]) and p is None:
+            failed += 1
+        hit = [x for x in (p or {}).get("rows", []) if _ixnorm(x[0]) == want]
+        if hit:
+            moves.append({"date": d, "title": t, "url": u,
+                          "eff": p.get("eff", ""),
+                          "in": [{"sym": x[2], "name": x[3]} for x in hit
+                                 if x[1] == "in"],
+                          "out": [{"sym": x[2], "name": x[3]} for x in hit
+                                  if x[1] == "out"]})
+        elif tre and tre.search(t) and not re.search(r"fixed income", t,
+                                                      re.I):
+            other.append({"date": d, "title": t, "url": u})
+    return {"ok": True, "index": name, "moves": moves, "other": other[:10],
+            "failed": failed, "source": "NSE Indices press releases "
+            "(niftyindices.com), last six months"}
 
 
 def tm_scenario(sym, kind, text):
@@ -21180,9 +22634,7 @@ CLOUD_REPO = "cas-news"
 # cas-news repository, next to his. It is kept scrambled so that no scanner
 # (GitHub's own included) takes it for a token and has it cancelled if this
 # folder is ever put online. It is never written into the repository.
-_SHARED_GH = ("b0xnWnpoS0pZUUdONTRFRkxEM3JsRkZPYWZYdXBIcEtJd2lkMW9jQkFtZVkzSTF6VzhEMWxFRDBaTFdfZzQwdjNlc3ZONDBnMEFSQzZVU0MxMV90YXBfYnVodGln")
-
-
+_SHARED_GH = ("")
 def shared_token():
     try:
         return base64.b64decode(_SHARED_GH).decode()[::-1]
@@ -21242,6 +22694,10 @@ def gh_api(method, path, token, body=None, timeout=25):
         except Exception:
             j = {"message": raw[:200].decode("utf-8", "replace")}
         return e.code, j, e.headers
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        # 20.23: GitHub not reachable at all - an answer, not a crash, so
+        # the job carries on and tries again at its next round
+        return 0, {"message": "GitHub could not be reached (%s)" % str(e)[:80]}, {}
 
 
 def cloud_read():
@@ -21519,6 +22975,13 @@ def cloud_extra_files():
             # do not use Gemini)
             txt = re.sub(r'(?m)^GEMINI_SHIPPED = "[^"]*"',
                          'GEMINI_SHIPPED = ""', txt)
+            # 20.19: nor the scrambled GitHub token (the copy there never
+            # uses it - found 6 Nov in the public copy, so it is taken out
+            # here and must be replaced on GitHub)
+            txt = re.sub(r'(?ms)^_SHARED_GH = \(.*?\)\s*$', '_SHARED_GH = ("")',
+                         txt, count=1)
+            if re.search(r"(?m)^_SHARED_GH = \(\"[^\"]", txt):
+                continue                 # never sent with a token in it
             out.append((path, txt))
         except OSError:
             pass
@@ -22481,6 +23944,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, {"error": "unknown address"})
             return False
         REQ.pid = None
+        REQ.user = False
         self._spid = None
         if auth_route(self, self.command, path):
             return False
@@ -22489,6 +23953,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"locked": True})
             return False
         REQ.pid = getattr(self, "_spid", None) or ACTIVE["pid"]
+        REQ.user = "page" if self.command == "POST" else False
         return True
 
     def handle_one_request(self):
@@ -22553,7 +24018,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path in ("/chart.js", "/voice.js", "/accounts.js", "/messages.js",
-                    "/portfolio.js", "/lang.js", "/taxes.js",
+                    "/portfolio.js", "/lang.js", "/taxes.js", "/tools.js",
                     "/vendor/lightweight-charts.js"):
             # the full chart (20.12): its own script, and TradingView's free
             # chart library (Apache 2.0 licence, kept beside it in vendor/)
@@ -22984,6 +24449,14 @@ class Handler(BaseHTTPRequestHandler):
                                               "error": "which part?"})
             return
 
+        if path == "/api/score":
+            self._send(200, stock_score(qs.get("sym", [""])[0]))
+            return
+
+        if path == "/api/holdalerts":
+            self._send(200, hold_alerts())
+            return
+
         if path == "/api/oldcheck":
             self._send(200, old_check())
             return
@@ -23047,6 +24520,14 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 days = 3
             self._send(200, ipo_past(days))
+            return
+
+        if path == "/api/ixchanges":
+            self._send(200, index_changes(qs.get("name", [""])[0][:40]))
+            return
+
+        if path == "/api/resmoves":
+            self._send(200, results_moves(qs.get("sym", [""])[0]))
             return
 
         if path == "/api/corp":
@@ -23200,7 +24681,7 @@ class Handler(BaseHTTPRequestHandler):
             # 20.12: the full chart and voice need their files beside the page
             miss = [f for f in ("chart.js", "voice.js", "accounts.js",
                                 "messages.js", "portfolio.js", "lang.js",
-                                "taxes.js", os.path.join("vendor", "lightweight-charts.js"))
+                                "taxes.js", "tools.js", os.path.join("vendor", "lightweight-charts.js"))
                     if not os.path.exists(os.path.join(HERE, f))]
             chk("Full chart and voice files", not miss,
                 "all present" if not miss else "missing: " + ", ".join(miss))
@@ -23588,6 +25069,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, cloud_status())
             return
 
+        if path == "/api/screener":
+            self._send(200, screener(qs.get("u", ["NIFTY 50"])[0]))
+            return
+        if path == "/api/screener/list":
+            self._send(200, {"ok": True, "india": SCREEN_INDIA, "foreign": list(SCREEN_FOREIGN)})
+            return
+        if path == "/api/tvcalls":
+            if "run" in qs:
+                threading.Thread(target=tv_calls_scan, daemon=True).start()
+            self._send(200, tv_calls_view())
+            return
         if path == "/api/picks":
             # the dashboard asks when it opens; after 7 in the morning the
             # day's picks are made once, READ AGAIN makes them afresh
@@ -23905,6 +25397,44 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(200, {"ok": False, "error": str(e)[:200]})
             return
+        if urllib.parse.urlparse(self.path).path == "/api/quit":
+            # 20.23: the app that has no window stops from here
+            self._send(200, {"ok": True})
+            threading.Thread(target=lambda: (time.sleep(1.0), os._exit(0)), daemon=True).start()
+            return
+        if urllib.parse.urlparse(self.path).path == "/api/backtest":
+            try:
+                n = max(0, int(self.headers.get("Content-Length", 0) or 0))
+                payload = json.loads(self.rfile.read(min(n, 20000)).decode("utf-8") or "{}")
+                self._send(200, backtest(payload if isinstance(payload, dict) else {}))
+            except Exception as e:
+                self._send(200, {"ok": False, "error": str(e)[:200]})
+            return
+        if urllib.parse.urlparse(self.path).path == "/api/history":
+            # 20.23: the master history of changes (behind the password)
+            try:
+                n = max(0, int(self.headers.get("Content-Length", 0) or 0))
+                payload = json.loads(self.rfile.read(min(n, 200000)).decode("utf-8") or "{}")
+                self._send(200, chg_action(payload if isinstance(payload, dict) else {}))
+            except Exception as e:
+                self._send(200, {"ok": False, "error": str(e)[:200]})
+            return
+        if urllib.parse.urlparse(self.path).path in ("/api/update/pack",
+                                                     "/api/update/install"):
+            # 20.23: the administrator's update, sent and installed
+            try:
+                n = max(0, int(self.headers.get("Content-Length", 0) or 0))
+                if n > 40 * 1024 * 1024 or self.headers.get("X-CAS") != "1":
+                    raise ValueError("refused")
+                payload = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception as e:
+                self._send(400, {"ok": False, "error": str(e)[:200]})
+                return
+            if self.path.startswith("/api/update/pack"):
+                self._send(200, update_pack())
+            else:
+                self._send(200, update_install(payload if isinstance(payload, dict) else {}))
+            return
         if urllib.parse.urlparse(self.path).path == "/api/accounts":
             try:
                 n = max(0, int(self.headers.get("Content-Length", 0) or 0))
@@ -23941,8 +25471,8 @@ class Handler(BaseHTTPRequestHandler):
         if urllib.parse.urlparse(self.path).path == "/api/tax":
             try:
                 n = max(0, int(self.headers.get("Content-Length", 0) or 0))
-                payload = json.loads(self.rfile.read(min(n, 500000))
-                                     .decode("utf-8"))
+                payload = json.loads(self.rfile.read(min(n, 30 * 1024 * 1024))
+                                     .decode("utf-8"))       # 20.23: documents too
                 self._send(200, tax_api(payload))
             except Exception as e:
                 self._send(200, {"ok": False, "error": str(e)[:200]})
@@ -25016,6 +26546,102 @@ def _sig_pad(digest, k):
     return b"\x00\x01" + b"\xff" * (k - 3 - len(digest)) + b"\x00" + digest
 
 
+# ---- 20.23: one link updates a user's copy --------------------------------------
+# The administrator's copy packs its program files (never Data) into one
+# signed file and sends it through Messages; a friend's copy installs it only
+# when the administrator's signature checks out, moves the old files to
+# Archive/before <version>, writes the new ones and starts again.
+UPDATE_DIRS = ("newsbot", "vendor")
+
+
+def _update_names():
+    out = []
+    for f in sorted(os.listdir(HERE)):
+        p = os.path.join(HERE, f)
+        if os.path.isfile(p) and (f == "cas_server.py" or f == "admin.json" or
+                                  f.endswith((".js", ".html"))):
+            out.append(f)
+    for dd in UPDATE_DIRS:
+        for root, dirs, files in os.walk(os.path.join(HERE, dd)):
+            dirs[:] = [x for x in dirs if x != "__pycache__"]
+            for f in files:
+                out.append(os.path.relpath(os.path.join(root, f), HERE).replace(os.sep, "/"))
+    return out
+
+
+def update_pack():
+    import zipfile
+    if not is_admin_copy():
+        return {"ok": False, "error": "Only the administrator's copy sends updates."}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for n in _update_names():
+            z.write(os.path.join(HERE, n), n)
+    blob = buf.getvalue()
+    sig = rsa_sign(blob)
+    if not sig:
+        return {"ok": False, "error": "This copy has no signing key."}
+    return {"ok": True, "version": VERSION, "size": len(blob),
+            "data": base64.b64encode(blob).decode(),
+            "sig": base64.b64encode(sig).decode()}
+
+
+def update_install(data):
+    import zipfile
+    try:
+        blob = base64.b64decode(str(data.get("data") or ""))
+        sig = base64.b64decode(str(data.get("sig") or ""))
+    except Exception:
+        return {"ok": False, "error": "The update file is damaged."}
+    if is_admin_copy():
+        return {"ok": False, "error": "This is the administrator's own copy - it is not updated this way."}
+    if not rsa_verify(blob, sig):
+        return {"ok": False, "error": "This update is not signed by the administrator - nothing was installed."}
+    try:
+        z = zipfile.ZipFile(io.BytesIO(blob))
+        names = [n for n in z.namelist() if not n.endswith("/")]
+        for n in names:
+            if n.startswith(("/", "\\")) or ".." in n.split("/") or \
+                    n.split("/")[0] in ("Data", "Archive"):
+                return {"ok": False, "error": "The update holds a file it should not: " + n}
+        src = z.read("cas_server.py").decode("utf-8")
+        compile(src, "cas_server.py", "exec")
+        m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+        ver = m.group(1) if m else "?"
+    except Exception as e:
+        return {"ok": False, "error": "The update could not be read: %s" % str(e)[:120]}
+    bdir = os.path.join(HERE, "Archive", "before %s (%s)" % (
+        ver, time.strftime("%Y-%m-%d %H%M")))
+    try:
+        for n in names:
+            old = os.path.join(HERE, *n.split("/"))
+            if os.path.isfile(old):
+                dst = os.path.join(bdir, *n.split("/"))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(old, "rb") as a, open(dst, "wb") as b:
+                    b.write(a.read())
+        for n in names:
+            dst = os.path.join(HERE, *n.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            tmp = dst + ".new"
+            with open(tmp, "wb") as f:
+                f.write(z.read(n))
+            os.replace(tmp, dst)
+    except Exception as e:
+        return {"ok": False, "error": "Not installed (%s). The old files are in Archive." % str(e)[:120]}
+    threading.Thread(target=_update_restart, daemon=True).start()
+    return {"ok": True, "version": ver, "from": VERSION,
+            "backup": os.path.basename(bdir)}
+
+
+def _update_restart():
+    time.sleep(1.5)
+    try:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception:
+        os._exit(3)
+
+
 def rsa_sign(payload):
     key = _read_json(USERS_FILE + ".k", {})
     if not key.get("n"):
@@ -25213,6 +26839,7 @@ def msg_load():
     d.setdefault("inbox", [])
     d.setdefault("rev", 0)
     d.setdefault("prefs", {"phone": True})
+    d.setdefault("groups", {})          # 20.23: group chats
     return d
 
 
@@ -25379,7 +27006,7 @@ def msg_poll(force=False):
             if c and c.get("blocked"):
                 continue
             d["inbox"].append(env)
-            if env.get("k") == "msg" and c:
+            if env.get("k") == "msg" and c and not c.get("muted"):
                 newmsg.append(c.get("name") or env.get("n") or "someone")
         d["inbox"] = d["inbox"][-500:]
         msg_save(d)
@@ -25435,7 +27062,11 @@ def msg_view(rev=None):
                          daemon=True).start()
     chats = {k: v[-300:] for k, v in d["chats"].items()}
     p = profile_read()
-    return {"ok": True, "me": me, "contacts": d["contacts"], "chats": chats,
+    # 20.23: groups are shown among the chats (they carry group: true)
+    contacts = dict(d["contacts"])
+    for gid, g in (d.get("groups") or {}).items():
+        contacts[gid] = dict(g, group=True, state=g.get("state") or "ok")
+    return {"ok": True, "me": me, "contacts": contacts, "chats": chats,
             "inbox": d["inbox"], "rev": d["rev"], "prefs": d.get("prefs"),
             "name": p.get("name") or "", "admin": adm.get("id") or "",
             "error": MSG_RT["error"], "isAdmin": bool(p.get("admin"))}
@@ -25530,18 +27161,19 @@ def msg_action(data):
             return {"ok": True, "sent": ok, "error": err}
         elif act == "contact":
             cid = msg_norm(data.get("id"))
-            c = d["contacts"].get(cid)
+            c = d["contacts"].get(cid) or d["groups"].get(cid)
             if not c:
                 return {"ok": False, "error": "No such contact"}
             for k, v in (data.get("patch") or {}).items():
                 if k in ("name", "locked", "theyLocked", "unread", "pub",
-                         "state"):
+                         "state", "pinned", "muted", "readUpto"):
                     c[k] = v if k != "name" else str(v)[:40]
             msg_save(d)
             return {"ok": True}
         elif act == "remove":
             cid = msg_norm(data.get("id"))
             d["contacts"].pop(cid, None)
+            d["groups"].pop(cid, None)
             for m in d["chats"].pop(cid, []):
                 _msg_file_drop(m.get("src"))
             msg_save(d)
@@ -25559,17 +27191,32 @@ def msg_action(data):
                     if not any(x.get("mid") == m.get("mid") for x in chat):
                         chat.append(m)
                         del chat[:-2000]
+                g = it.get("group")     # 20.23: a group, as its last message says
+                if isinstance(g, dict) and cid:
+                    old = d["groups"].get(cid) or {}
+                    d["groups"][cid] = dict(old, name=str(g.get("name") or
+                                                          old.get("name") or "Group")[:40],
+                                            members=(g.get("members") or [])[:60],
+                                            admins=(g.get("admins") or [])[:60],
+                                            state=g.get("state") or "ok",
+                                            added=old.get("added") or
+                                            time.strftime("%d %b %Y"))
                 patch = it.get("contact")
-                if isinstance(patch, dict) and cid in d["contacts"]:
-                    d["contacts"][cid].update({k: v for k, v in patch.items()
-                                               if k in ("pub", "state", "name",
-                                                        "theyLocked", "unread")})
+                tgt = d["contacts"].get(cid) or d["groups"].get(cid)
+                if isinstance(patch, dict) and tgt is not None:
+                    tgt.update({k: v for k, v in patch.items()
+                                if k in ("pub", "state", "name", "theyLocked",
+                                         "unread", "readUpto")})
                 fx = it.get("fix")      # a receipt changes a message already kept
                 if isinstance(fx, dict) and cid:
                     for x in d["chats"].get(cid, []):
                         if x.get("mid") == fx.get("mid"):
+                            if fx.get("gone"):
+                                for k in ("text", "card", "file", "list", "src"):
+                                    x.pop(k, None)
                             x.update({k: v for k, v in fx.items()
-                                      if k in ("seen", "opened", "gone", "marks")})
+                                      if k in ("seen", "opened", "gone", "marks",
+                                               "text", "edited")})
             d["inbox"] = [e for e in d["inbox"] if e.get("eid") not in done]
             msg_save(d)
             return {"ok": True}
@@ -25607,6 +27254,45 @@ def msg_action(data):
                         for k in ("text", "card", "file", "list", "src"):
                             x.pop(k, None)
                         x["gone"] = True
+            msg_save(d)
+            return {"ok": True}
+        elif act == "group":
+            # 20.23: make or change a group (members are message IDs)
+            gid = msg_norm(data.get("gid")) or ("G" + secrets.token_hex(8).upper())[:16]
+            old = d["groups"].get(gid) or {}
+            d["groups"][gid] = dict(old, name=str(data.get("name") or
+                                                  old.get("name") or "Group")[:40],
+                                    members=(data.get("members") or
+                                             old.get("members") or [])[:60],
+                                    admins=(data.get("admins") or
+                                            old.get("admins") or [])[:60],
+                                    state=str(data.get("state") or "ok"),
+                                    added=old.get("added") or
+                                    time.strftime("%d %b %Y"))
+            msg_save(d)
+            return {"ok": True, "gid": gid}
+        elif act == "keep":
+            # 20.23: one copy of what was sent to a group, in the group chat
+            cid = msg_norm(data.get("cid"))
+            k = data.get("keep")
+            if cid and isinstance(k, dict):
+                chat = d["chats"].setdefault(cid, [])
+                chat.append(k)
+                del chat[:-2000]
+                msg_save(d)
+            return {"ok": True}
+        elif act == "edit":
+            # 20.23: my own message changed (or removed for everyone)
+            cid = msg_norm(data.get("cid"))
+            for x in d["chats"].get(cid, []):
+                if x.get("mid") == data.get("mid"):
+                    if data.get("gone"):
+                        for k in ("text", "card", "file", "list", "src"):
+                            x.pop(k, None)
+                        x["gone"] = True
+                    else:
+                        x["text"] = str(data.get("text") or "")[:8000]
+                        x["edited"] = True
             msg_save(d)
             return {"ok": True}
         elif act == "keepfile":
@@ -25943,6 +27629,38 @@ def code_use(code, pid):
             AUTH["codes"].pop(code, None)
             if AUTH["devreq"] and AUTH["devreq"].get("code") == code:
                 AUTH["devreq"] = None
+            return True
+    return False
+
+
+def admin_reset_code(name, day=None):
+    """20.23: a reset code the administrator makes for one user (by the
+    name of the profile). His copy and the friend's copy share admin.json,
+    so the friend's copy checks it without any network: 8 digits, good on
+    the day it is made and the next, and only once."""
+    key = (admin_read().get("masterHash") or "") + "|reset"
+    day = day or time.strftime("%Y-%m-%d")
+    nm = re.sub(r"\s+", " ", str(name or "")).strip().lower()
+    h = _hmac.new(key.encode(), (nm + "|" + day).encode(),
+                  hashlib.sha256).hexdigest()
+    return "%08d" % (int(h[:12], 16) % 100000000)
+
+
+def admin_code_use(code, pid):
+    code = re.sub(r"\D", "", str(code or ""))
+    if len(code) != 8 or not admin_read().get("masterHash"):
+        return False
+    name = profile_get(pid).get("name") or ""
+    f = os.path.join(DATA_DIR, "reset_codes_used.json")
+    used = _read_json(f, [])
+    used = used if isinstance(used, list) else []
+    now = datetime.date.today()
+    for day in (now, now - datetime.timedelta(days=1)):
+        ds = day.strftime("%Y-%m-%d")
+        if _hmac.compare_digest(admin_reset_code(name, ds), code):
+            if code + ds in used:
+                return False
+            _write_json(f, (used + [code + ds])[-200:])
             return True
     return False
 
@@ -26323,7 +28041,8 @@ def auth_guess(path, data, device):
             return 200, {"ok": False, "error": "Too many wrong codes this "
                          "hour - try again later, or use the master "
                          "password."}, None, False
-        if code_use(data.get("code"), pid):
+        if code_use(data.get("code"), pid) or admin_code_use(
+                data.get("code"), pid):
             AUTH["codeFails"] = 0
             auth_ok(pid)
             profile_switch(pid)
@@ -26706,7 +28425,7 @@ def auth_call(handler, method, path, data, device):
         users_write_txt()
         return 200, {"ok": True}, None, False
 
-    if path in ("/api/auth/users", "/api/auth/ban"):
+    if path in ("/api/auth/users", "/api/auth/ban", "/api/auth/resetcode"):
         # 20.13: the administrator's list of users, and banishing one (for
         # a time or for good) - confirmed with his master password
         if not p.get("admin"):
@@ -26715,6 +28434,12 @@ def auth_call(handler, method, path, data, device):
         if path == "/api/auth/users":
             return 200, {"ok": True, "users": users_with_bans(),
                          "channel": ban_topic()}, None, False
+        if path == "/api/auth/resetcode":
+            nm = str(data.get("name") or "").strip()
+            if not nm:
+                return 200, {"ok": False, "error": "No name."}, None, False
+            return 200, {"ok": True, "code": admin_reset_code(nm),
+                         "name": nm}, None, False
         if device_is_phone_port(handler):
             return 403, {"ok": False, "error": "Do this on the computer."}, \
                 None, False
@@ -27907,6 +29632,9 @@ class PhoneHandler(BaseHTTPRequestHandler):
             ctype = "text/javascript; charset=utf-8"
         elif p.path == "/ping":
             body, ctype = b'{"ok": true}', "application/json"
+        elif p.path == "/api/m/money":
+            body = json.dumps(phone_money()).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
         elif p.path == "/api/m/extra":
             body = json.dumps(phone_extra()).encode("utf-8")
             ctype = "application/json; charset=utf-8"
@@ -27940,6 +29668,7 @@ class PhoneHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Edits from the phone: one note, or today's buys into YESTERDAY."""
+        REQ.user = "phone"
         import hmac
         p = urllib.parse.urlparse(self.path)
         key = urllib.parse.parse_qs(p.query).get("k", [""])[0]
@@ -28052,6 +29781,8 @@ def phone_post(path, data):
         if ok == "conflict":
             return 409, {"ok": False, "conflict": True}
         return (200 if ok else 400), {"ok": bool(ok)}
+    if path in ("/api/m/acc", "/api/m/pf"):
+        return phone_money_save(path[-3:].strip("/"), data)
     if path == "/api/m/ruledone":
         rules_done(str(data.get("id") or ""))
         return 200, {"ok": True}
@@ -28191,6 +29922,83 @@ def phone_fno(sym):
     for old in sorted(PHONE_FNO, key=lambda x: PHONE_FNO[x][0])[:-8]:
         PHONE_FNO.pop(old, None)
     return out
+
+
+def phone_money():
+    """20.23: the phone's MONEY section - holdings, the Accounts rows and the
+    other investments, as they stand now (the phone keeps the last copy,
+    labelled with its time, for when the laptop is away)."""
+    out = {"ok": True, "at": time.strftime("%d %b %Y %H:%M"),
+           "types": list(ACC_TYPES), "hold": [], "tx": [], "pf": []}
+    acc = acc_load()
+    if acc:
+        v = acc_compute(acc, acc_broker())
+        out["hold"] = [{k: h.get(k) for k in ("sym", "date", "qty", "pledged",
+                                               "avg", "invested", "ltp", "value",
+                                               "pl", "plPct", "age")}
+                       for h in v.get("holdings") or [] if (h.get("qty") or 0) > 0][:400]
+        out["tx"] = [dict(t, i=i) for i, t in enumerate(acc.get("tx") or [])][-200:]
+    try:
+        out["pf"] = [x for x in (portfolio_load().get("items") or [])
+                     if isinstance(x, dict)][:400]
+    except Exception:
+        out["pf"] = []
+    return out
+
+
+def _same_row(a, b):
+    """Two rows alike, whatever way the phone wrote the numbers (1 or 1.0)."""
+    def n(o):
+        if isinstance(o, bool) or o is None:
+            return o
+        if isinstance(o, (int, float)):
+            return round(float(o), 6)
+        if isinstance(o, dict):
+            return {k: n(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [n(v) for v in o]
+        return o
+    return json.dumps(n(a), sort_keys=True) == json.dumps(n(b), sort_keys=True)
+
+
+def phone_money_save(kind, data):
+    """A change made on the phone (perhaps hours ago, away from home). It is
+    refused when the row has since been changed on the laptop (409), so the
+    laptop's version is never overwritten without his knowing."""
+    if kind == "acc":
+        acc = acc_load() or {}
+        tx = acc.get("tx") or []
+        rid = str(data.get("id") or "")
+        idx = next((i for i, t in enumerate(tx) if str(t.get("id")) == rid),
+                   None) if rid else None
+        if rid and idx is None:
+            return 400, {"ok": False, "error": "That row is no longer in the Accounts."}
+        was = data.get("was")
+        if idx is not None and isinstance(was, dict) and _same_row(
+                tx[idx], {k: v for k, v in was.items() if k != "i"}):
+            pass
+        elif idx is not None and isinstance(was, dict):
+            return 409, {"ok": False, "conflict": True}
+        if data.get("op") == "delete":
+            r = accounts_action({"action": "tx-delete", "index": idx})
+        else:
+            r = accounts_action({"action": "tx-save", "row": data.get("row") or {},
+                                 "index": idx})
+        return (200 if r.get("ok") else 400), r
+    d = portfolio_load()
+    it = data.get("item") if isinstance(data.get("item"), dict) else {}
+    pid = str(it.get("id") or data.get("id") or "")
+    cur = next((x for x in d.get("items") or [] if str(x.get("id")) == pid), None) if pid else None
+    if pid and cur is None:
+        return 400, {"ok": False, "error": "That investment is no longer there."}
+    was = data.get("was")
+    if cur is not None and isinstance(was, dict) and not _same_row(cur, was):
+        return 409, {"ok": False, "conflict": True}
+    if data.get("op") == "delete":
+        r = portfolio_action({"action": "delete", "id": pid})
+    else:
+        r = portfolio_action({"action": "save", "item": it})
+    return (200 if r.get("ok") else 400), r
 
 
 def phone_extra():
@@ -28426,7 +30234,7 @@ def main():
                eod_watcher, admin_poller, bans_poller, preview_watcher, rules_watcher,
                palert_loop, gemini_relay_loop, lt_warm_loop, msg_loop,
                acc_backup_loop, asset_loop, funda_loop, advtax_loop,
-               reco_track_loop):
+               reco_track_loop, tax_rule_loop, tv_calls_loop):
         threading.Thread(target=fn, daemon=True).start()
     try:
         srv.serve_forever()
@@ -28475,6 +30283,346 @@ def my_symbols(state=None):
     except Exception:
         pass
     out.discard("")
+    return out
+
+
+# ---- 20.20: pledge and big-holder alerts on the shares he holds ----
+PLEDGE_FILE = os.path.join(DATA_DIR, "pledge_seen.json")
+HOLDALERT = {"at": 0, "out": None, "busy": False, "lock": threading.Lock()}
+
+
+def held_symbols(st=None):
+    """The shares he holds: OLD / YESTERDAY / Out of list and the
+    Accounts' holdings (not the rest of the watchlist)."""
+    st = st or load_state()
+    out = {str(s).upper() for s in corp_symbols(st)}
+    try:
+        acc = acc_load()
+        if acc:
+            for r in acc_compute(acc, acc_broker()).get("holdings") or []:
+                if (r.get("qty") or 0) > 0:
+                    out.add(str(r.get("sym") or "").upper())
+    except Exception:
+        pass
+    out.discard("")
+    return out
+
+
+def _pledge_pct(sym):
+    """% of the promoters' shares pledged, as last filed (NSE)."""
+    d, _e = SESSION.fetch("https://www.nseindia.com/api/corporate-pledgedata"
+                          "?index=equities&symbol=" + Q(sym),
+                          "https://www.nseindia.com/companies-listing/"
+                          "corporate-filings-pledged-data")
+    rows = d if isinstance(d, list) else (d or {}).get("data") or []
+    if not rows or not isinstance(rows[0], dict):
+        return None
+    try:
+        return (float(str(rows[0].get("percPromoterShares")).strip()),
+                str(rows[0].get("shp") or ""))
+    except ValueError:
+        return None
+
+
+def _hold_alerts_make():
+    held = held_symbols()
+    alerts = []
+    # 1. promoters' pledge up by a point or more since it was last read
+    seen = _read_json(PLEDGE_FILE, {})
+    first = not seen
+    for sym in sorted(held):
+        got = _pledge_pct(sym)
+        time.sleep(0.25)
+        if not got:
+            continue
+        pct, qtr = got
+        was = seen.get(sym)
+        if was and not first and pct - was.get("pct", 0) >= 1.0:
+            alerts.append({"key": "pl|%s|%s|%.2f" % (sym, qtr, pct),
+                           "sym": sym, "kind": "pledge", "score": 100 + pct -
+                           was["pct"], "text": "Promoters' pledge up: %.2f%% "
+                           "of their shares pledged (was %.2f%%), as at %s"
+                           % (pct, was["pct"], qtr)})
+        seen[sym] = {"pct": pct, "qtr": qtr, "at": time.strftime("%Y-%m-%d")}
+    _write_json(PLEDGE_FILE, seen)
+    # 2. a big fund or investor in or out (bulk / block deals of ₹5 crore
+    # or more in a share he holds, the last two days)
+    dl = mkt_deals()
+    cut = (datetime.date.today() - datetime.timedelta(days=3)).isoformat()
+    for r in (dl.get("rows") or []) if dl.get("ok") else []:
+        sym = str(r.get("sym") or "").upper()
+        val = (r.get("qty") or 0) * (r.get("price") or 0)
+        if sym in held and str(r.get("date") or "") >= cut and val >= 5e7:
+            alerts.append({"key": "dl|%s|%s|%s|%s|%s" % (
+                r.get("date"), sym, r.get("who"), r.get("side"), r.get("qty")),
+                "sym": sym, "kind": r.get("kind"), "score": val / 1e7,
+                "text": "%s %s %s: %s shares at \u20b9%s (\u20b9%.1f crore), %s"
+                % (r.get("who"), "bought" if r.get("side") == "BUY" else
+                   "sold", sym, "{:,.0f}".format(r.get("qty") or 0),
+                   r.get("price"), val / 1e7, r.get("kind") + " deal on " +
+                   str(r.get("date")))})
+    alerts.sort(key=lambda a: -a["score"])
+    return {"ok": True, "alerts": alerts[:12], "held": len(held),
+            "baseline": first, "dealsOk": bool(dl.get("ok")),
+            "dealsError": "" if dl.get("ok") else dl.get("error", "")}
+
+
+def hold_alerts():
+    """Read at most every 3 hours, in the background (about 70 NSE reads)."""
+    with HOLDALERT["lock"]:
+        fresh = HOLDALERT["out"] and time.time() - HOLDALERT["at"] < 3 * 3600
+        if fresh or HOLDALERT["busy"]:
+            return HOLDALERT["out"] or {"ok": False, "busy": True}
+        HOLDALERT["busy"] = True
+
+    def work():
+        try:
+            out = _hold_alerts_make()
+        except Exception as e:
+            out = {"ok": False, "error": str(e)[:120]}
+        with HOLDALERT["lock"]:
+            HOLDALERT.update(out=out, at=time.time(), busy=False)
+    threading.Thread(target=work, daemon=True).start()
+    return HOLDALERT["out"] or {"ok": False, "busy": True}
+
+
+# ---- 20.20: STOCK SCORE, 0-100 for any share, every part shown ----
+SCORE_CACHE = {}
+DELIV_ALL = {"day": "", "map": {}}
+
+
+def _sn(v):
+    """'₹ 3,55,096 Cr.' / '38.9 %' / '-2%' -> number or None."""
+    m = re.search(r"-?[\d,]*\.?\d+", str(v or "").replace("\u2212", "-"))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _lin(x, lo, hi, pts):
+    """x at or below lo -> 0, at or above hi -> pts, straight line between
+    (lo may be above hi for 'lower is better')."""
+    if x is None:
+        return None
+    f = (x - lo) / (hi - lo)
+    return round(max(0.0, min(1.0, f)) * pts, 2)
+
+
+def _row(tab, *names):
+    for r in (tab or {}).get("rows") or []:
+        cells = r.get("cells") if isinstance(r, dict) else r
+        if cells and str(cells[0]).strip().rstrip("+ ").lower() in \
+                [n.lower() for n in names]:
+            return cells
+    return None
+
+
+def deliv_all():
+    """Delivery % of every NSE share from the latest daily file."""
+    today = datetime.date.today()
+    days = ([today] if is_trading_day(today) and
+            datetime.datetime.now().hour >= 18 else []) + \
+        [prior_trading_day(today)]
+    for day in days:
+        if DELIV_ALL["day"] == day.isoformat():
+            return DELIV_ALL
+        url = ("https://nsearchives.nseindia.com/products/content/"
+               "sec_bhavdata_full_%s.csv" % day.strftime("%d%m%Y"))
+        try:
+            raw = urllib.request.urlopen(urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0"}), timeout=25).read()
+        except Exception:
+            continue
+        lines = raw.decode("utf-8", "replace").splitlines()
+        if len(lines) < 10:
+            continue
+        head = [h.strip() for h in lines[0].split(",")]
+        mp = {}
+        for ln in lines[1:]:
+            m = dict(zip(head, [x.strip() for x in ln.split(",")]))
+            if m.get("SERIES") == "EQ":
+                mp[m.get("SYMBOL", "").upper()] = to_number(m.get("DELIV_PER"))
+        DELIV_ALL.update(day=day.isoformat(), map=mp)
+        return DELIV_ALL
+    return {"day": "", "map": {}}
+
+
+def stock_score(sym):
+    sym = re.sub(r"[^A-Z0-9&_-]", "", str(sym or "").upper())[:20]
+    if not sym:
+        return {"ok": False, "error": "No share named."}
+    hit = SCORE_CACHE.get(sym)
+    if hit and time.time() - hit[0] < 1800:
+        return hit[1]
+    co = company_info(sym)
+    if not co.get("ok"):
+        return {"ok": False, "error": "could not fetch the latest (%s)" %
+                (co.get("error") or "Screener did not answer")}
+    scr = co.get("scr") or {}
+    top = dict((k, v) for k, v in scr.get("top") or [])
+    price, pe = _sn(top.get("Current Price")), _sn(top.get("Stock P/E"))
+    parts = []
+
+    def part(group, name, how, value, pts, got):
+        parts.append({"group": group, "name": name, "how": how,
+                      "value": value, "max": pts, "pts": got})
+    # VALUATION 20 - P/E against the median P/E of its peers (Screener)
+    peers = scr.get("peers") or {}
+    heads = [str(h).strip().lower() for h in peers.get("heads") or []]
+    pes = []
+    if "p/e" in heads and "cmp rs." in heads:
+        ip, ic = heads.index("p/e"), heads.index("cmp rs.")
+        for r in peers.get("rows") or []:
+            c = r.get("cells") if isinstance(r, dict) else r
+            try:
+                p, cmp_ = _sn(c[ip]), _sn(c[ic])
+            except IndexError:
+                continue
+            if p and p > 0 and not (price and cmp_ and pe and abs(cmp_ - price)
+                                    <= 0.005 * price and abs(p - pe) <= 0.005
+                                    * pe):
+                pes.append(p)
+    med = sorted(pes)[len(pes) // 2] if pes else None
+    if pe and pe > 0 and med:
+        ratio = pe / med
+        part("Valuation", "P/E against its peers", "P/E %.1f ÷ peers' median "
+             "%.1f = %.2f. 0.6 or less: 20 points; 1.6 or more: 0; in "
+             "between, in proportion" % (pe, med, ratio), "%.2f" % ratio, 20,
+             _lin(ratio, 1.6, 0.6, 20))
+    elif pe is None or pe <= 0:
+        part("Valuation", "P/E against its peers", "no P/E (a loss, or not "
+             "given) - 0 points", "-", 20, 0.0 if pe is not None else None)
+    else:
+        part("Valuation", "P/E against its peers", "no peer P/E to compare",
+             "-", 20, None)
+    # QUALITY 20 - ROCE 10, ROE 5, operating margin 5
+    roce, roe = _sn(top.get("ROCE")), _sn(top.get("ROE"))
+    part("Quality", "ROCE", "5% or less: 0; 25% or more: 10", "%s%%" % roce
+         if roce is not None else "-", 10, _lin(roce, 5, 25, 10))
+    part("Quality", "ROE", "5% or less: 0; 20% or more: 5", "%s%%" % roe
+         if roe is not None else "-", 5, _lin(roe, 5, 20, 5))
+    opm = _row(scr.get("quarters"), "OPM %", "OPM")
+    o = _sn(opm[-1]) if opm else None
+    part("Quality", "Operating margin, last quarter", "5% or less: 0; 25% or "
+         "more: 5 (banks have none)", "%s%%" % o if o is not None else "-", 5,
+         _lin(o, 5, 25, 5))
+    # GROWTH 15 - sales and profit, last 12 months against the last year
+    ann = scr.get("annual") or {}
+    ah = ann.get("heads") or []
+    for nm, rn in (("Sales", ("Sales", "Revenue")),
+                   ("Net profit", ("Net Profit",))):
+        r = _row(ann, *rn)
+        g = None
+        if r and len(r) >= 3 and ah and str(ah[-1]).upper() == "TTM":
+            a, b = _sn(r[-1]), _sn(r[-2])
+            if a is not None and b:
+                g = (a / b - 1) * 100 if b > 0 else None
+        part("Growth", nm + " growth", "last 12 months against %s; 0%% or "
+             "less: 0; 20%% or more: 7.5" % (ah[-2] if len(ah) > 1 else
+                                              "the last year"),
+             "%+.1f%%" % g if g is not None else "-", 7.5,
+             _lin(g, 0, 20, 7.5))
+    # TREND 15 - the price against its 50- and 200-day averages, 3 months
+    ser, fresh = daily_closes(sym)
+    c = [x[1] for x in ser]
+    if len(c) >= 200 and not fresh:
+        part("Trend", "Price against its averages", "could not fetch the "
+             "latest prices (the newest close is %s)" % (ser[-1][0] if ser
+                                                          else "-"),
+             "-", 15, None)
+    elif len(c) >= 200:
+        s50, s200 = sum(c[-50:]) / 50, sum(c[-200:]) / 200
+        part("Trend", "Above its 200-day average", "close %.2f (%s) against "
+             "%.2f: 6 if above, 0 if below" % (c[-1], ser[-1][0], s200), "yes" if c[-1] > s200
+             else "no", 6, 6.0 if c[-1] > s200 else 0.0)
+        part("Trend", "Above its 50-day average", "%.2f against %.2f: 4 if "
+             "above, 0 if below" % (c[-1], s50), "yes" if c[-1] > s50
+             else "no", 4, 4.0 if c[-1] > s50 else 0.0)
+        r3 = (c[-1] / c[-64] - 1) * 100
+        part("Trend", "Move over 3 months", "-15% or worse: 0; +15% or "
+             "better: 5", "%+.1f%%" % r3, 5, _lin(r3, -15, 15, 5))
+    else:
+        part("Trend", "Price against its averages", "not enough price "
+             "history", "-", 15, None)
+    # OWNERSHIP 10 - promoters, institutions (a year), promoters' pledge
+    sh = scr.get("shareholding") or {}
+    n_q = len(sh.get("heads") or [])
+    back = min(4, n_q - 1) if n_q > 1 else 0
+    pr = _row(sh, "Promoters")
+    fi, di = _row(sh, "FIIs"), _row(sh, "DIIs")
+    if pr and back:
+        ch = _sn(pr[-1]) - _sn(pr[-1 - back])
+        part("Ownership", "Promoters' holding, change", "over %d quarters; "
+             "-2 points of holding or worse: 0; +2 or better: 4" % back,
+             "%+.2f" % ch, 4, _lin(ch, -2, 2, 4))
+    else:
+        part("Ownership", "Promoters' holding, change", "no promoter "
+             "holding shown (not counted)", "-", 4, None)
+    if fi and di and back:
+        ch = (_sn(fi[-1]) + _sn(di[-1])) - (_sn(fi[-1 - back]) +
+                                            _sn(di[-1 - back]))
+        part("Ownership", "FIIs + DIIs, change", "over %d quarters; -4 or "
+             "worse: 0; +4 or better: 4" % back, "%+.2f" % ch, 4,
+             _lin(ch, -4, 4, 4))
+    else:
+        part("Ownership", "FIIs + DIIs, change", "not given", "-", 4, None)
+    pv = dict(((co.get("nse") or {}).get("pledge") or {}).get("vals") or [])
+    pp = next((_sn(v) for k, v in pv.items() if "promoter shares" in
+               k.lower()), None)
+    part("Ownership", "Promoters' shares pledged", "0%: 2; 10% or more: 0",
+         "%s%%" % pp if pp is not None else "-", 2, _lin(pp, 10, 0, 2))
+    # DELIVERY AND DEALS 10
+    dv = deliv_all()
+    dp = dv["map"].get(sym)
+    part("Delivery and deals", "Delivery %%, %s" % (dv["day"] or "-"),
+         "20% or less: 0; 60% or more: 6", "%s%%" % dp if dp is not None
+         else "-", 6, _lin(dp, 20, 60, 6))
+    dl = mkt_deals()
+    if dl.get("ok"):
+        net = sum(((r.get("qty") or 0) * (1 if r.get("side") == "BUY" else -1))
+                  for r in dl.get("rows") or [] if str(r.get("sym")).upper()
+                  == sym)
+        n = sum(1 for r in dl.get("rows") or [] if str(r.get("sym")).upper()
+                == sym)
+        part("Delivery and deals", "Bulk and block deals, 10 days", "none: 2; "
+             "more bought than sold: 4; more sold: 0", "%d deal%s, net %s" % (
+                 n, "" if n == 1 else "s", "{:+,.0f}".format(net)) if n else
+             "none", 4, 2.0 if not n else 4.0 if net > 0 else 0.0 if net < 0
+             else 2.0)
+    else:
+        part("Delivery and deals", "Bulk and block deals", "could not fetch "
+             "the latest", "-", 4, None)
+    # ANALYSTS 10 - the latest broker call (Trendlyne)
+    rc = reco_for(sym)
+    if rc and rc.get("call"):
+        cl = str(rc.get("call")).upper()
+        cp = 6.0 if re.search(r"BUY|ACCUMULATE|ADD|OUTPERFORM|OVERWEIGHT",
+                              cl) else 0.0 if re.search(
+            r"SELL|REDUCE|UNDERPERFORM|UNDERWEIGHT", cl) else 3.0
+        part("Analysts", "Latest call", "%s by %s (%s): buy-side 6, hold 3, "
+             "sell-side 0" % (cl, rc.get("house") or "?", rc.get("on") or "?"),
+             cl, 6, cp)
+        tg = to_number(rc.get("target"))
+        up = (tg / price - 1) * 100 if tg and price else None
+        part("Analysts", "Room to the target", "target %s against %s; 0%% or "
+             "less: 0; 20%% or more: 4" % (tg, price), "%+.1f%%" % up
+             if up is not None else "-", 4, _lin(up, 0, 20, 4))
+    else:
+        part("Analysts", "Broker calls", "no call found for %s" % sym, "-",
+             10, None)
+    got = sum(p["pts"] for p in parts if p["pts"] is not None)
+    avail = sum(p["max"] for p in parts if p["pts"] is not None)
+    if avail < 50:
+        return {"ok": False, "error": "could not fetch the latest (too little "
+                "data for %s to score it: %d of 100 points readable)"
+                % (sym, avail)}
+    out = {"ok": True, "sym": sym, "name": co.get("name") or sym,
+           "score": round(got / avail * 100), "got": round(got, 1),
+           "avail": avail, "parts": parts, "at": time.strftime("%d %b %H:%M")}
+    SCORE_CACHE[sym] = (time.time(), out)
     return out
 
 
@@ -28833,11 +30981,13 @@ def old_check():
     if not acc:
         return {"ok": False, "error": "No Accounts yet."}
     v = acc_compute(acc, acc_broker())
-    held = {}
+    held, pledged = {}, {}
     for r in v.get("holdings") or []:
         if (r.get("qty") or 0) > 0:
             s = str(r.get("sym") or "").upper()
             held[s] = held.get(s, 0) + r["qty"]
+            if r.get("pledged"):
+                pledged[s] = pledged.get(s, 0) + r["pledged"]
     last = max((str(t.get("date") or "") for t in acc.get("tx") or []),
                default="")
     notes = st.get("notes") or {}
@@ -28870,7 +31020,7 @@ def old_check():
             rows.append({"sym": s, "old": "(not in the table or Out of "
                          "list)", "acc": a, "why": "held in the Accounts "
                          "only"})
-    return {"ok": True, "rows": rows, "accTo": last,
+    return {"ok": True, "rows": rows, "accTo": last, "pledged": pledged,
             "checked": len(set(wl) | set(held)),
             "oldLabel": corp_labels(st)[0]}
 
@@ -29058,6 +31208,16 @@ RECOTRACK_SEEN = {"once": False}
 
 # what each version added, shown once after an update and in Diagnostics
 WHATS_NEW = {
+    "20.23": [
+        "Messages: groups (👥 New group), ✓✓ when seen, pin, mute, search, edit or delete for everyone within 5 minutes, the unread count on 💬",
+        "💡 Feature requests that only the administrator gets; the administrator sends updates with one message (Install), and makes a reset code for a forgotten password",
+        "Diagnostics → History: every change you make anywhere, behind your password - undo any one, go back to just before it, do again",
+        "Taxes: 234B / 234C, trusts, your own rates (or tell Gemini), questions instead of limitations, documents and AIS read for you, the ITR capital-gains layout, monthly rule check, losses carried forward, print any page",
+        "🔎 Screener, ⏪ Backtest and 🎯 Options strategy (bottom right); calls made on TV at the top of OPPORTUNITIES with a pop-up for a new one",
+        "✋ Hand gestures beside 📺; the assistant is a small orb in the corner; 🎤 on every box where you describe something to Gemini",
+        "Phone: MONEY - Holdings, Accounts and other investments, changed on the phone and sent when the laptop answers",
+        "Profile in sections; one Shares choice with countries; All of the above; a table for each kind you tick; a short new tour",
+        "Capital Compass.app with Python inside (Mac) and for Windows - nothing to install, runs from a pen drive; Diagnostics → Stop"],
     "20.19": [
         "Accounts → Trades → Read a contract note: the PDF (or a photo or screenshot) fills the trades, and every charge is checked against your Accounts to the paisa; a difference is shown in red and nothing changes without your yes",
         "Market box (📊 button): FII / DII flows, bulk and block deals and insider filings in your shares, delivery %, a sector heatmap down to the shares, and the big investors' portfolios",
